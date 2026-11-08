@@ -1,0 +1,6 @@
+gameboy
+gameboy.o
+*.o
+*.sav
+frame.ppm
+/tmp/
