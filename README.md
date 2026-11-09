@@ -157,7 +157,7 @@ back. **5 of 12 pass:**
 | 04-sweep | 8 | Failed #8 "If shift=0 and period>0, trigger enables" |
 | 05-sweep details | 8 | Failed #8 "Subtract mode uses two's complement (upper bound)" |
 | 07-len sweep period sync | 2 | Failed #2 "Length period is wrong" |
-| 08-len ctr during power | 1 | Failed; lengths read back `00 00 10 00`, CRC `6B86CD4D` (DMG expects `11 22 44 33`) |
+| 08-len ctr during power | 1 | Failed; lengths read back `00 00 11 00`, CRC `729DFC0C` (DMG expects `11 22 44 33`) |
 | 11-regs after power | 4 | Failed #4 "Powering off shouldn't affect NR41" |
 
 The wave family (09/10/12) and the register/trigger-overflow tests

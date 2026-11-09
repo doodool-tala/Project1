@@ -4904,6 +4904,7 @@ apu_io_write:
     jne .done
     mov byte [apu_power],1
     mov byte [apu_fs_step],0
+    mov dword [apu_fs_cyc],0
     jmp .done
 .nr52_off:
     cmp byte [apu_power],0
@@ -5297,7 +5298,7 @@ apu_step:
     mov r14,rdi
     mov byte [apu_wave_flag],0
     cmp byte [apu_power],0
-    je .fs_start
+    je .off_done
     ; channel sample timers
     xor r12d,r12d
 .tim_loop:
@@ -5391,12 +5392,17 @@ apu_step:
     jmp .fs_advance
 .fs_env:
     call apu_clock_env
+    jmp .fs_advance
 .fs_advance:
     mov al,[apu_fs_step]
     inc al
     and al,7
     mov [apu_fs_step],al
     jmp .fs_loop
+.off_done:
+    ; while NR52 bit 7 is clear the frame sequencer neither steps nor
+    ; clocks anything; the phase is restarted by the power-on write
+    jmp .done
 .done:
     pop r15
     pop r14
