@@ -4834,49 +4834,48 @@ apu_io_write:
     or eax,edx
     mov [apu_freq+r12*2],ax
 .reg4_freq_done:
-    ; trigger first (may reload a zero length), then handle the 0->1
-    ; length-enable transition and its extra length clock.
-    test r14b,0x80
-    jz .reg4_no_trig
-    movzx eax,word [apu_len+r12*2]
-    test eax,eax
-    setz r15b
-    movzx r15d,r15b
-    push r15
-    mov rdi,r12
-    call apu_trigger
-    pop r15
-    test r15d,r15d
-    jz .reg4_no_trig
-    mov byte [apu_lenen+r12],0
-.reg4_no_trig:
+    ; DMG length-enable semantics, in hardware order:
+    ;  1. a 0->1 enable edge clocks the length once when the next DIV-APU
+    ;     step does not clock length (fs_step odd) and the length is
+    ;     non-zero; if that makes it zero and no trigger follows, the
+    ;     channel is disabled and the counter frozen;
+    ;  2. a trigger then unfreezes a zero length and reloads it to
+    ;     maximum, except when the length is enabled by the same write
+    ;     and the next step does not clock length, in which case the
+    ;     reload lands one short (max-1).
+    movzx r15d,byte [apu_lenen+r12]     ; previous enable state
+    movzx ebx,word [apu_len+r12*2]      ; previous length
     test r14b,0x40
-    jz .reg4_dis_len
-    cmp byte [apu_lenen+r12],0
-    jne .reg4_set_len
-    ; 0->1: extra clock iff the upcoming fs step doesn't clock length
+    jz .reg4_after_en
+    test r15d,r15d
+    jnz .reg4_after_en
+    test ebx,ebx
+    jz .reg4_after_en
     test byte [apu_fs_step],1
-    jnz .reg4_set_len
-    movzx eax,word [apu_len+r12*2]
-    test eax,eax
-    jz .reg4_set_len
-    dec eax
-    mov [apu_len+r12*2],ax
-    test eax,eax
-    jnz .reg4_set_len
+    jz .reg4_after_en
+    dec ebx
+    mov [apu_len+r12*2],bx
+    test ebx,ebx
+    jnz .reg4_after_en
     test r14b,0x80
-    jz .reg4_zero_off
-    mov ecx,64
-    cmp r12d,2
-    jne .reg4_zero_max
-    mov ecx,256
-.reg4_zero_max:
-    mov [apu_len+r12*2],cx
-    jmp .reg4_set_len
-.reg4_zero_off:
+    jnz .reg4_after_en                 ; trigger unfreezes it instead
     mov byte [apu_active+r12],0
     mov byte [apu_frozen+r12],1
+.reg4_after_en:
+    test r14b,0x80
+    jz .reg4_set_len
+    mov rdi,r12
+    call apu_trigger
+    test ebx,ebx                       ; did the trigger reload a zero?
+    jnz .reg4_set_len
+    test r14b,0x40
+    jz .reg4_set_len
+    test byte [apu_fs_step],1
+    jz .reg4_set_len
+    dec word [apu_len+r12*2]
 .reg4_set_len:
+    test r14b,0x40
+    jz .reg4_dis_len
     mov byte [apu_lenen+r12],1
     jmp .done
 .reg4_dis_len:
