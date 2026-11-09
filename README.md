@@ -99,11 +99,18 @@ re-loaded on the next run.
   | 10-bit ops.gb | 7f5b8e488c6988b5 | Passed |
   | 11-op a,(hl).gb | 0ec0cf9fda3f00be | Passed |
 
-  Multicart `cpu_instrs.gb`
-  (`8c5e12f41e0ba5bb…56fcf2`) prints `01:ok …` progressively over
-  serial; extended runs record tens of thousands of subtests logged
-  `ok` with zero failures (61,524+ subtests and counting in the
-  longest run, still progressing when the frame cap was reached).
+  Multicart `cpu_instrs.gb` (`8c5e12f41e0ba5bb…56fcf2`) runs the whole
+  suite as **256 subtests per pass and then repeats**. Runs were
+  verified pass-by-pass from the serial log:
+  * a 12M-frame run logged **240 complete passes** (61,524 `ok`
+    results, **0 failures**), every pass identical;
+  * a fresh 300k-frame run from the committed tree logged **10
+    complete passes** (2,670 `ok`, 0 failures), pass 1 byte-identical
+    to pass 2.
+
+  So one full suite pass covers all 256 subtests, and the ROM keeps
+  looping it; the emulator reproduces that indefinitely with no
+  failures.
 * **Blargg `mem_timing` — all 3 singles and the multicart report
   `Passed`** (read/write/modify memory-access cycle timing, verified
   via the cartridge-RAM verdict at $A000, status 0). ROMs are from the
