@@ -101,12 +101,28 @@ re-loaded on the next run.
 
   Multicart `cpu_instrs.gb`
   (`8c5e12f41e0ba5bb…56fcf2`) prints `01:ok …` progressively over
-  serial (reached test `A2` with all `ok` at 700k frames).
+  serial; extended runs record tens of thousands of subtests logged
+  `ok` with zero failures (61,524+ subtests and counting in the
+  longest run, still progressing when the frame cap was reached).
+* **Blargg `mem_timing` — all 3 singles and the multicart report
+  `Passed`** (read/write/modify memory-access cycle timing, verified
+  via the cartridge-RAM verdict at $A000, status 0). ROMs are from the
+  same public archive.org set:
+
+  | ROM | SHA-256 (first 16) | Result |
+  | --- | --- | --- |
+  | 01-read_timing.gb | d9c6e86b7008fdae | Passed |
+  | 02-write_timing.gb | 9188e5d9cf9dfc9e | Passed |
+  | 03-modify_timing.gb | 818256ab477bb8fb | Passed |
+  | mem_timing.gb (multicart) | ab9daf4c51f417c4 | 01:ok 02:ok 03:ok Passed |
 * **Input:** in headless mode the emulator also reads key bytes from
   stdin (`w`=Up, `s`=Down, `a`=Left, `d`=Right, `z`=B, `x`=A,
   `Enter`=Start, `Space`=Select; keys are momentary per frame). Verified
   with a P1-reading test cartridge: no input → prints `N`; piped `x`
-  (A button) → prints `Y` (549× in 5 frames); piped `z` (B) → still `N`.
+  (A button) → prints `Y` (549× in 600 frames); piped `z` (B) → prints
+  `Y` on a B-button variant of the same cartridge (549×), and `x` on
+  that variant still prints `N`. Real frames of `mem_timing` and
+  `cpu_instrs` render their test screens in the four DMG colours.
 
 ## Known limitations
 

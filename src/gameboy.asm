@@ -1325,6 +1325,33 @@ step_system:
     pop r12
     pop rbx
     ret
+
+; do_prestep(edi=T-cycles): advance system before a memory access so the
+; access lands on its correct intra-instruction cycle. Accumulates into
+; prestep_done so cpu_finish_step only steps the remainder.
+; Preserves all registers.
+do_prestep:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r12
+    push r13
+    push r14
+    push r15
+    add [prestep_done],edi
+    call step_system
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
 step_timer:
     push rbx
     push rcx
@@ -1366,6 +1393,7 @@ step_timer:
     sub ecx,eax               ; ecx = number of falling edges
     test ecx,ecx
     jz .updprev
+    js .updprev               ; negative (should not happen): ignore
     ; apply ticks one by one: TIMA++, overflow -> reload TMA + IRQ
 .tickloop:
     inc byte [io+0x05]
@@ -1601,7 +1629,7 @@ render_scanline:
     test byte [io+0x40],0x10
     jnz .t_unsigned
     movsx rcx,cl
-    lea rax,[vram+0x880]
+    lea rax,[vram+0x800]   ; 0x8800 tile data (vram base = 0x8000)
     shl rcx,4
     add rax,rcx
     jmp .t_addr
@@ -1866,6 +1894,7 @@ set_pixel_from_indextmp:
 
 section .bss
 instr_cycles: resd 1
+prestep_done: resd 1   ; T-cycles already stepped before handler (intra-instruction timing)
 tmp16: resw 1
 tmp8: resb 1
 section .text
@@ -2396,6 +2425,7 @@ cpu_step:
     push r14
     push r15
     mov dword [instr_cycles],4
+    mov dword [prestep_done],0
     ; halted handling
     cmp byte [halted],0
     je .not_halted
@@ -2447,6 +2477,50 @@ cpu_step:
     pop rdi
     pop rax
 .nodebug:
+    ; intra-instruction timing: pre-step for last-cycle memory accesses
+    ; (LD (BC/DE/HL±),A / LD A,(BC/DE/HL±) 8T -> 4; LD (HL),d8 / LDH 12T -> 8;
+    ; LD (a16),A / LD A,(a16) 16T -> 12). LD r,r and ALU A,r (HL) variants
+    ; pre-step inside their blocks below; INC/DEC (HL) split-step in handlers.
+    cmp r12d,0x02
+    je .pre4
+    cmp r12d,0x12
+    je .pre4
+    cmp r12d,0x22
+    je .pre4
+    cmp r12d,0x32
+    je .pre4
+    cmp r12d,0x0A
+    je .pre4
+    cmp r12d,0x1A
+    je .pre4
+    cmp r12d,0x2A
+    je .pre4
+    cmp r12d,0x3A
+    je .pre4
+    cmp r12d,0xE2
+    je .pre4
+    cmp r12d,0xF2
+    je .pre4
+    cmp r12d,0x36
+    je .pre8
+    cmp r12d,0xE0
+    je .pre8
+    cmp r12d,0xF0
+    je .pre8
+    cmp r12d,0xEA
+    je .pre12
+    cmp r12d,0xFA
+    je .pre12
+    jmp .pre_done
+.pre4:  mov edi,4
+    call do_prestep
+    jmp .pre_done
+.pre8:  mov edi,8
+    call do_prestep
+    jmp .pre_done
+.pre12: mov edi,12
+    call do_prestep
+.pre_done:
     ; CB prefix
     cmp r12d,0xCB
     je .do_cb
@@ -2462,6 +2536,15 @@ cpu_step:
     and r13d,7
     mov r14d,r12d
     and r14d,7
+    cmp r13d,6
+    je .ldr_pre
+    cmp r14d,6
+    je .ldr_pre
+    jmp .ldr_nopre
+.ldr_pre:
+    mov edi,4
+    call do_prestep
+.ldr_nopre:
     mov rdi,r14
     call get_r
     movzx esi,al
@@ -2486,6 +2569,11 @@ cpu_step:
     and r13d,7
     mov r14d,r12d
     and r14d,7
+    cmp r14d,6
+    jne .alu_nopre
+    mov edi,4
+    call do_prestep
+.alu_nopre:
     mov rdi,r14
     call get_r
     mov bl,al
@@ -2825,6 +2913,15 @@ cpu_step:
 .do_cb:
     call fetch8
     mov r12d,eax
+    ; CB (HL): BIT read at cycle 3 (pre-step 8), modify read at cycle 3
+    ; (pre-step 8, mid-step 4 before write inside cb_execute). Reg ops: none.
+    mov eax,r12d
+    and eax,7
+    cmp eax,6
+    jne .cb_nopre
+    mov edi,8
+    call do_prestep
+.cb_nopre:
     call cb_execute
     jmp cpu_finish_step
 cpu_finish_step:
@@ -2836,6 +2933,8 @@ cpu_finish_step:
     mov byte [ime],1
 .ei_done:
     mov eax,[instr_cycles]
+    sub eax,dword [prestep_done]
+    mov dword [prestep_done],0
     mov rdi,rax
     call step_system
     mov eax,[instr_cycles]
@@ -2884,10 +2983,21 @@ op_inc_r:
     mov r13d,r12d
     shr r13d,3
     and r13d,7
+    cmp r13d,6
+    jne .inc_nopre
+    ; INC (HL): read at cycle 2 (step 4), write at cycle 3 (step 4 more)
+    mov edi,4
+    call do_prestep
+.inc_nopre:
     mov rdi,r13
     call get_r
     call inc8
     movzx esi,al
+    cmp r13d,6
+    jne .inc_nopre2
+    mov edi,4
+    call do_prestep
+.inc_nopre2:
     mov rdi,r13
     call set_r
     mov dword [instr_cycles],4
@@ -2899,10 +3009,21 @@ op_dec_r:
     mov r13d,r12d
     shr r13d,3
     and r13d,7
+    cmp r13d,6
+    jne .dec_nopre
+    ; DEC (HL): read at cycle 2 (step 4), write at cycle 3 (step 4 more)
+    mov edi,4
+    call do_prestep
+.dec_nopre:
     mov rdi,r13
     call get_r
     call dec8
     movzx esi,al
+    cmp r13d,6
+    jne .dec_nopre2
+    mov edi,4
+    call do_prestep
+.dec_nopre2:
     mov rdi,r13
     call set_r
     mov dword [instr_cycles],4
@@ -3787,10 +3908,22 @@ cb_execute:
     not dl
     and rbx,rdx
 .store:
+    cmp r13d,6
+    jne .store_nopre
+    ; CB modify (HL): write at cycle 4 -> step 4 more before set_r
+    mov edi,4
+    call do_prestep
+.store_nopre:
     mov rdi,r13
     movzx esi,bl
     call set_r
 .nostore:
+    ; decide cycles BEFORE popping r13 (pops restore caller's r13)
+    mov eax,8
+    cmp r13d,6
+    jne .cb_cyc_ok
+    mov eax,16
+.cb_cyc_ok:
     pop r14
     pop r13
     pop r12
@@ -3799,13 +3932,7 @@ cb_execute:
     pop rdx
     pop rcx
     pop rbx
-    mov dword [instr_cycles],8
-    cmp r13d,6
-    jne .ret
-    mov dword [instr_cycles],16
-    cmp r14d,0
-    jne .ret
-    mov dword [instr_cycles],16
+    mov [instr_cycles],eax
 .ret:
     ret
 cb_xx:
