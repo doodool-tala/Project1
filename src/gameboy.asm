@@ -1328,53 +1328,86 @@ step_system:
 step_timer:
     push rbx
     push rcx
-    mov eax,[div_counter]
-    add eax,edi
-    mov [div_counter],eax
+    push r8
+    push r9
+    push r10
+    mov r8d,[div_counter]       ; old counter
+    mov r10d,edi                ; delta T-cycles (instr_cycles are T-cycles)
+    add r8d,edi
+    mov [div_counter],r8d       ; new counter in r8d
     mov al,[io+0x07]
     test al,0x04
-    jz .noedge
+    jz .disabled
     movzx rcx,al
     and ecx,3
     cmp ecx,0
-    je .sh9
+    je .p9
     cmp ecx,1
-    je .sh3
+    je .p3
     cmp ecx,2
-    je .sh5
-    ; 3 -> sh7
-    mov edx,eax
-    shr edx,7
-    and edx,1
-    jmp .bitdone
-.sh9: mov edx,eax
-    shr edx,9
-    and edx,1
-    jmp .bitdone
-.sh3: mov edx,eax
-    shr edx,3
-    and edx,1
-    jmp .bitdone
-.sh5: mov edx,eax
-    shr edx,5
-    and edx,1
-.bitdone:
-    cmp byte [prev_tac_bit],1
-    jne .updateprev
-    cmp edx,0
-    jne .updateprev
-    ; falling edge -> TIMA++
+    je .p5
+    mov r9d,256               ; freq 03 -> bit7, period 256 T
+    jmp .edges
+.p9: mov r9d,1024              ; freq 00 -> bit9, period 1024 T
+    jmp .edges
+.p3: mov r9d,16                ; freq 01 -> bit3, period 16 T
+    jmp .edges
+.p5: mov r9d,64                ; freq 02 -> bit5, period 64 T
+.edges:
+    ; falling edges = floor(new/P) - floor(old/P), old = new - delta
+    mov eax,r8d
+    xor edx,edx
+    div r9d                   ; eax = new/P, edx = new%P
+    mov ecx,eax               ; new/P
+    mov eax,r8d
+    sub eax,r10d              ; old counter
+    xor edx,edx
+    div r9d                   ; eax = old/P
+    sub ecx,eax               ; ecx = number of falling edges
+    test ecx,ecx
+    jz .updprev
+    ; apply ticks one by one: TIMA++, overflow -> reload TMA + IRQ
+.tickloop:
     inc byte [io+0x05]
-    jnz .updateprev
+    jnz .tickcont
     mov al,[io+0x06]
     mov [io+0x05],al
     push rdi
     mov rdi,4
     call request_irq
     pop rdi
-.updateprev:
+.tickcont:
+    dec ecx
+    jnz .tickloop
+.updprev:
+    ; update current input level (selected bit & enable) for TAC-write edge
+    mov eax,r8d
+    mov edx,eax
+    ; selected bit value: bit = (counter >> b) & 1 where period P=2^(b+1) -> b=log2(P)-1
+    ; derive shift from P: 16->3, 64->5, 256->7, 1024->9
+    cmp r9d,16
+    je .s3
+    cmp r9d,64
+    je .s5
+    cmp r9d,256
+    je .s7
+    shr edx,9
+    jmp .sdone
+.s3: shr edx,3
+    jmp .sdone
+.s5: shr edx,5
+    jmp .sdone
+.s7: shr edx,7
+.sdone:
+    and edx,1
     mov [prev_tac_bit],dl
-.noedge:
+    jmp .out2
+.disabled:
+    mov byte [prev_tac_bit],0
+.out2:
+    pop r10
+    pop r9
+    pop r8
     pop rcx
     pop rbx
     ret
@@ -2194,31 +2227,38 @@ add_hl: ; ax=rp value
     push rbx
     push rcx
     push rdx
+    push r8
     movzx ecx,ax
     movzx eax,byte [gb_h]
     shl eax,8
     movzx edx,byte [gb_l]
     or eax,edx
-    mov ebx,eax
     add eax,ecx
-    mov [tmp16],ax
-    mov byte [gb_f],0
+    mov r8d,eax
+    and r8d,0xFFFF
+    mov dl,[gb_f]
+    and dl,0x80
+    mov [gb_f],dl
     cmp eax,0x10000
     jb .noc
     or byte [gb_f],0x10
 .noc:
-    mov edx,ebx
+    movzx ebx,byte [gb_h]
+    shl ebx,8
+    movzx edx,byte [gb_l]
+    or ebx,edx
+    and ebx,0x0FFF
+    mov edx,ecx
     and edx,0x0FFF
-    mov r8d,ecx
-    and r8d,0x0FFF
-    add edx,r8d
-    cmp edx,0x1000
+    add ebx,edx
+    cmp ebx,0x1000
     jb .noh
     or byte [gb_f],0x20
 .noh:
-    mov ax,[tmp16]
-    mov [gb_l],al
-    mov [gb_h],ah
+    mov [gb_l],r8b
+    shr r8d,8
+    mov [gb_h],r8b
+    pop r8
     pop rdx
     pop rcx
     pop rbx
@@ -2639,7 +2679,7 @@ cpu_step:
     cmp r12d,0x39
     je op_add_hl
     cmp r12d,0x3A
-    je op_ld_a_hl_inc
+    je op_ld_a_hl_dec
     cmp r12d,0x3B
     je op_dec_sp
     cmp r12d,0x3C
@@ -2885,9 +2925,9 @@ op_ld_r_d8:
     jmp cpu_finish_step
 op_ld_hl_d8: ; 0x36 LD (HL),d8
     call fetch8
-    mov dil,al
+    mov r8b,al
     mov rdi,6
-    movzx esi,dil
+    movzx esi,r8b
     call set_r
     mov dword [instr_cycles],12
     jmp cpu_finish_step
@@ -2983,9 +3023,63 @@ op_add_hl: ; rp = (op>>4)&3  0BC 1DE 2HL 3SP
     mov r13d,r12d
     shr r13d,4
     and r13d,3
-    mov rdi,r13
-    call get_rp
-    call add_hl
+    cmp r13d,0
+    je .rp_bc
+    cmp r13d,1
+    je .rp_de
+    cmp r13d,2
+    je .rp_hl
+    movzx ecx,word [gb_sp]
+    jmp .do_add
+.rp_bc:
+    movzx ecx,byte [gb_c]
+    movzx eax,byte [gb_b]
+    shl eax,8
+    or eax,ecx
+    mov ecx,eax
+    jmp .do_add
+.rp_de:
+    movzx ecx,byte [gb_e]
+    movzx eax,byte [gb_d]
+    shl eax,8
+    or eax,ecx
+    mov ecx,eax
+    jmp .do_add
+.rp_hl:
+    movzx ecx,byte [gb_l]
+    movzx eax,byte [gb_h]
+    shl eax,8
+    or eax,ecx
+    mov ecx,eax
+.do_add:
+    movzx eax,byte [gb_h]
+    shl eax,8
+    movzx edx,byte [gb_l]
+    or eax,edx
+    add eax,ecx
+    mov [tmp16],ax
+    mov dl,[gb_f]
+    and dl,0x80
+    mov [gb_f],dl
+    cmp eax,0x10000
+    jb .noc
+    or byte [gb_f],0x10
+.noc:
+    movzx ebx,byte [gb_h]
+    shl ebx,8
+    movzx edx,byte [gb_l]
+    or ebx,edx
+    and ebx,0x0FFF
+    mov edx,ecx
+    and edx,0x0FFF
+    add ebx,edx
+    cmp ebx,0x1000
+    jb .noh
+    or byte [gb_f],0x20
+.noh:
+    mov ax,[tmp16]
+    mov [gb_l],al
+    mov [gb_h],ah
     mov dword [instr_cycles],8
     jmp cpu_finish_step
 op_ld_bc_a: ; (BC),A
@@ -3046,7 +3140,20 @@ op_ld_hl_dec_a: ; (HL-),A 0x32
     call set_rp
     mov dword [instr_cycles],8
     jmp cpu_finish_step
-op_ld_a_hl_inc: ; A,(HL+) 0x2A/0x3A
+op_ld_a_hl_dec: ; A,(HL-) 0x3A
+    mov rdi,2
+    call get_rp
+    movzx rdi,ax
+    mov r10d,eax
+    call read_mem
+    mov [gb_a],al
+    dec r10w
+    movzx esi,r10w
+    mov rdi,2
+    call set_rp
+    mov dword [instr_cycles],8
+    jmp cpu_finish_step
+op_ld_a_hl_inc: ; A,(HL+) 0x2A
     mov rdi,2
     call get_rp
     movzx rdi,ax
@@ -3059,10 +3166,15 @@ op_ld_a_hl_inc: ; A,(HL+) 0x2A/0x3A
     call set_rp
     mov dword [instr_cycles],8
     jmp cpu_finish_step
-op_ld_a16_sp: ; (a16),SP 0x08
+op_ld_a16_sp: ; (a16),SP 0x08  writes lo at a16, hi at a16+1
     call fetch16
-    movzx rdi,ax
+    movzx r8d,ax                ; a16
+    mov rdi,r8
+    movzx rsi,byte [gb_sp]      ; lo byte of SP
+    call write_mem
+    lea rdi,[r8+1]
     movzx rsi,word [gb_sp]
+    shr rsi,8                   ; hi byte of SP
     call write_mem
     mov dword [instr_cycles],20
     jmp cpu_finish_step
@@ -3441,20 +3553,26 @@ op_daa:
     jne .chk_high
     add ebx,6
 .chk_high:
-    cmp al,0x9F
+    xor ecx,ecx
+    cmp al,0x99
     jbe .chk_c
-    add ebx,0x60
+    mov ecx,1
 .chk_c:
     test byte [gb_f],0x10
     jz .apply
-    add ebx,0x60
+    mov ecx,1
 .apply:
+    test ecx,ecx
+    jz .apply2
+    add ebx,0x60
+.apply2:
     add al,bl
     mov [gb_a],al
-    mov cl,[gb_f]
-    and cl,0x10
     mov byte [gb_f],0
-    or [gb_f],cl
+    test ecx,ecx
+    jz .nc2
+    or byte [gb_f],0x10
+.nc2:
     cmp al,0
     jne .done
     or byte [gb_f],0x80
@@ -3566,7 +3684,7 @@ cb_execute:
     cmp eax,4
     je .sla
     cmp eax,5
-    je .sra
+    je .sra_h
     cmp eax,6
     je .swap
     ; SRL
@@ -3610,9 +3728,13 @@ cb_execute:
     shl ebx,1
     shr edx,7
     jmp .flags_shift
-.sra:
+.sra_h:
+    mov r8d,ebx
     mov edx,ebx
+    and edx,0x80
     shr ebx,1
+    or ebx,edx
+    mov edx,r8d
     and edx,1
     jmp .flags_shift
 .swap:
@@ -3628,6 +3750,7 @@ cb_execute:
 .swap_done:
     jmp .store
 .flags_shift:
+    and ebx,0xFF
     mov byte [gb_f],0
     cmp ebx,0
     jne .fs_nz
@@ -3699,7 +3822,7 @@ run_emulator:
     push r15
     ; terminal setup if not headless
     cmp byte [cli_headless],0
-    jne .loop
+    jne .headless_input
     ; TCGETS
     mov rax,SYS_ioctl
     mov rdi,0
@@ -3738,6 +3861,23 @@ run_emulator:
     mov byte [stdin_nonblock],1
     lea rdi,[esc_hide]
     call prints0
+    jmp .loop
+.headless_input:
+    ; still allow piped stdin input in headless mode (e.g. for tests)
+    mov rax,SYS_fcntl
+    mov rdi,0
+    mov rsi,F_GETFL
+    syscall
+    cmp rax,0
+    jl .loop
+    or rax,O_NONBLOCK
+    mov rcx,rax
+    mov rax,SYS_fcntl
+    mov rdi,0
+    mov rsi,F_SETFL
+    mov rdx,rcx
+    syscall
+    mov byte [stdin_nonblock],1
 .loop:
     ; frame limit
     cmp qword [cli_frames],0
@@ -3786,7 +3926,16 @@ run_emulator:
 timespec_16ms: dq 0, 8000000
 
 ; ---------- poll keyboard (nonblocking read) ----------
+; keys are momentary: cleared each frame, set from bytes read this frame
 poll_input:
+    mov byte [key_up],0
+    mov byte [key_down],0
+    mov byte [key_left],0
+    mov byte [key_right],0
+    mov byte [key_a],0
+    mov byte [key_b],0
+    mov byte [key_start],0
+    mov byte [key_select],0
     cmp byte [stdin_nonblock],0
     je .d
     push rbx

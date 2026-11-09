@@ -57,7 +57,9 @@ re-loaded on the next run.
 * **Interrupts:** VBlank, LCD STAT, Timer, Serial, Joypad with correct
   priority and vector addresses (40/48/50/58/60).
 * **Joypad:** P1 (FF00) button/D-pad group selection; key presses raise
-  the joypad interrupt.
+  the joypad interrupt. Keyboard input is momentary (visible for one
+  frame per key byte); in headless mode keys may also be supplied on
+  stdin.
 * **Serial:** SB/SC (FF01/FF02) — writes SB to stdout when a transfer starts.
 * **APU:** 4 channels — two square waves with duty/volume, wave channel
   (FF30–FF3F wave RAM), noise channel (LFSR), channel triggers (NRx4),
@@ -74,9 +76,37 @@ re-loaded on the next run.
   `./gameboy --headless --frames 240 --serial --dump frame.ppm tests/hello.gb`
   Expected: serial prints `OK`, and the dumped frame contains exactly the
   four DMG palette colours with the checker pattern and sprite visible.
+  Frame hash (240 frames, this build):
+  `42d4f7d8150df80bd806ae838828130b7a060ac1802431b43be5d4e09415b4ea`.
 * CPU flag behaviour was verified against a 25-case serial test ROM
   (ADD/ADC/SUB/SBC, AND/XOR/OR/CP, INC, ADD HL, RLCA/RRCA/RLA, SLA, SWAP,
   BIT, DAA, PUSH/POP, CALL, (HL±), ADD SP / LD HL,SP+e8) — all cases pass.
+* **Blargg `cpu_instrs` singles — all 11 report `Passed`**
+  (`./gameboy --headless --frames 60000 --serial ROM.gb`). ROMs are from
+  the public archive.org Blargg test-ROM set (repo does not contain ROMs):
+
+  | ROM | SHA-256 (first 16) | Result |
+  | --- | --- | --- |
+  | 01-special.gb | fe61349cbaee10cc | Passed |
+  | 02-interrupts.gb | fb90b0d2b9501910 | Passed |
+  | 03-op sp,hl.gb | ca553e606d9b9c86 | Passed |
+  | 04-op r,imm.gb | 7686aa7a39ef3d25 | Passed |
+  | 05-op rp.gb | d504adfa0a4c4793 | Passed |
+  | 06-ld r,r.gb | 17ada54b0b9c1a33 | Passed |
+  | 07-jr,jp,call,ret,rst.gb | ab31d3daaaa3a98b | Passed |
+  | 08-misc instrs.gb | 974a71fe4c67f70f | Passed |
+  | 09-op r,r.gb | b28e1be5cd95f22b | Passed |
+  | 10-bit ops.gb | 7f5b8e488c6988b5 | Passed |
+  | 11-op a,(hl).gb | 0ec0cf9fda3f00be | Passed |
+
+  Multicart `cpu_instrs.gb`
+  (`8c5e12f41e0ba5bb…56fcf2`) prints `01:ok …` progressively over
+  serial (reached test `A2` with all `ok` at 700k frames).
+* **Input:** in headless mode the emulator also reads key bytes from
+  stdin (`w`=Up, `s`=Down, `a`=Left, `d`=Right, `z`=B, `x`=A,
+  `Enter`=Start, `Space`=Select; keys are momentary per frame). Verified
+  with a P1-reading test cartridge: no input → prints `N`; piped `x`
+  (A button) → prints `Y` (549× in 5 frames); piped `z` (B) → still `N`.
 
 ## Known limitations
 
