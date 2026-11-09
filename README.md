@@ -20,7 +20,7 @@ then `PATH=$PWD/nasm-*/:$PATH make`.
 ## Usage
 
 ```sh
-./gameboy [--headless] [--frames N] [--dump FILE.ppm] [--serial] [--audio FILE.wav] [--debug] ROM.gb
+./gameboy [--headless] [--frames N] [--dump FILE.ppm] [--serial] [--audio FILE.wav] [--debug] [--exit-on-result] ROM.gb
 ```
 
 * **Terminal mode (default):** renders the 160×144 screen as ANSI true-color
@@ -33,6 +33,9 @@ then `PATH=$PWD/nasm-*/:$PATH make`.
   stdout. This lets test ROMs (e.g. CPU test suites) print results.
 * `--audio FILE.wav` — write 44.1 kHz mono 16-bit WAV audio.
 * `--debug` — trace PC:opcode for the first 200 instructions to stdout.
+* `--exit-on-result` — stop as soon as the cartridge writes a final result
+  byte (the `$A000` verdict leaves `$80`), save `ROM.gb.sav`, and print the
+  number of frames executed as a little-endian 64-bit value on stderr.
 
 Cartridge RAM (MBC1/3/5) is saved next to the ROM as `ROM.gb.sav` and
 re-loaded on the next run.
@@ -141,9 +144,9 @@ re-loaded on the next run.
 
 ## dmg_sound (APU) results
 
-Each single ROM was run headless (1500 frames, well past every subtest)
-and its own `$A000` verdict byte, `DE B0 61` signature and text were read
-back. **12 of 12 pass:**
+Each single ROM was run headless with `--exit-on-result`, so every run
+stopped at the ROM's own `$A000` verdict instead of at a fixed frame
+count. **12 of 12 pass:**
 
 | ROM | status | result |
 | --- | --- | --- |
@@ -160,6 +163,10 @@ back. **12 of 12 pass:**
 | 11-regs after power | 0 | `Passed`, including #4 |
 | 12-wave write while on | 0 | `Passed` |
 
+Exit frames, in table order: 50, 565, 1009, 74, 71, 55, 35, 82, 36, 234,
+43, 234. They are identical to the counts measured before the MBC1
+cartridge-type fix described below, so sweep and frame-sequencer timing
+did not move.
 
 The five length/trigger/power ROMs (02, 03, 07, 08, 11) were failing on
 one bus bug rather than on five separate behaviours. `apu_active` stores
@@ -199,10 +206,34 @@ DIV-aligned: ticks at frame-sequencer steps 2 and 6, four steps = 32768
 cycles = 128 Hz apart. All twelve singles now print `Passed` with status
 0 and signature `DE B0 61`.
 
-The multicart `dmg_sound.gb` runs every test at four alignments. At 80000
-headless frames it had printed `01:ok` through `70:ok` with no failures, and
-its `$A000` status was still `80`, so it had not reached its own final verdict
-within that run; the 12 singles above are the complete measured pass.
+The multicart `dmg_sound.gb` now reports its own final verdict: status
+`00`, signature `DE B0 61`, and the console text `dmg_sound` /
+`01:ok 02:ok ... 12:ok` / `Passed` after **2133 frames** (~1.2 s of
+emulated time).
+
+`$80` is not a failure status and does not mean a test is still running in
+the sense of "not yet reached": the console setup (`init_text_out`) writes
+the `DE B0 61` signature and then `$80`, and only the exit path
+(`post_exit`, reached at `$2bcd`) writes the final byte. The earlier
+80000-frame run was in fact stuck in the multicart's slot scan, which
+exposed two MBC1 bugs:
+
+* The emulator only enabled MBC1 banking for cartridge types `$11`/`$12`
+  (which are actually MBC3). The real MBC1 IDs `$01`/`$02`/`$03` were
+  ignored, so every `$2000` ROM-bank write was dropped. Every Blargg cart
+  here is type `$03`, so the driver's scan read bank 1's `$C3` test entry
+  for every counter value and never reached the terminal slot that returns
+  from the driver.
+* Banked reads did not alias out-of-range banks by ROM size. The terminal
+  step is bank 4 in a 4-bank cart; hardware wraps that to bank 0 (the MBC1
+  zero-to-one substitution looks at the 5-bit register value, and 4 is
+  non-zero), where the slot byte is `$00`.
+
+Routing types `$01`-`$03` to MBC1 and masking banked reads with
+`rom_banks-1` after the zero-to-one substitution fixed both. The
+aggregate needs no joypad input (bank 0 contains no P1 reads) and no
+serial handshake; the twelve singles keep the same verdicts and exit
+frames after both fixes.
 
 ## Known limitations
 
@@ -210,8 +241,9 @@ within that run; the 12 singles above are the complete measured pass.
   power semantics, wave-RAM read/write gating and the DMG trigger
   corruption are implemented and measured (12/12 `dmg_sound` singles
   pass, including both sweep ROMs, all four wave ROMs, both
-  length-counter/power ROMs and the trigger ROM). No stereo panning in
-  the WAV output.
+  length-counter/power ROMs and the trigger ROM, and the `dmg_sound`
+  multicart prints `Passed` with status 0 at 2133 frames). No stereo
+  panning in the WAV output.
 * MBC1 in mode-1 high-bit ROM banking, and MBC3 RTC, are stubs.
 * A cartridge with CGB double-speed mode, or the `STOP` instruction, will
   run at DMG speed only (STOP is treated as a short pause).
