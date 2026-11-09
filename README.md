@@ -61,9 +61,17 @@ re-loaded on the next run.
   frame per key byte); in headless mode keys may also be supplied on
   stdin.
 * **Serial:** SB/SC (FF01/FF02) — writes SB to stdout when a transfer starts.
-* **APU:** 4 channels — two square waves with duty/volume, wave channel
-  (FF30–FF3F wave RAM), noise channel (LFSR), channel triggers (NRx4),
-  mixed to WAV (envelope/length/sweep sequencer is approximate).
+* **APU:** a real 512 Hz frame sequencer (8192 T-cycles per step) clocks
+  the four channels: length counters at 256 Hz, sweep at 128 Hz and the
+  volume envelope at 64 Hz. Implemented: per-channel length counters with
+  reload (0 -> max), freeze/unfreeze, the DMG extra-length-clock quirk,
+  DAC gating and trigger effects; sweep with shadow frequency, period-0
+  treated as 8, negate-mode flag/quirk and overflow disable; NR52 power
+  on/off (registers 0x10-0x25 cleared on power-off, reads masked while
+  off, wave RAM preserved, length counters not clocked while off);
+  per-register read masks (write-only bits read as 1s); wave-RAM access
+  gating while channel 3 plays; duty/wave/noise sample timers. The four
+  channels mix to mono 16-bit WAV.
 * **Cartridge controllers:** ROM-only, MBC1 (ROM/RAM banking + mode),
   MBC3 (ROM/RAM banking; RTC registers accepted), MBC5, external RAM
   banking, echo RAM (E000–FDFF), HRAM, and .sav persistence.
@@ -131,9 +139,37 @@ re-loaded on the next run.
   that variant still prints `N`. Real frames of `mem_timing` and
   `cpu_instrs` render their test screens in the four DMG colours.
 
+## dmg_sound (APU) results
+
+Each single ROM was run headless (4000 frames) and its own `$A000`
+verdict byte, `DE B0 61` signature and text were read back. 2 of 12 pass:
+
+| ROM | status | result |
+| --- | --- | --- |
+| 01-registers | 0 | `Passed` |
+| 06-overflow on trigger | 0 | `Passed` (`0556 0667 071D 0788 07C2 07E1 07F1`) |
+| 02-len ctr | 2 | Failed #2 "Length becoming 0 should clear status" |
+| 03-trigger | 4 | Failed #4 "Anything besides enabling shouldnt't clock" |
+| 04-sweep | 8 | Failed #8 "If shift=0 and period>0, trigger enables" |
+| 05-sweep details | 8 | Failed #8 "Subtract mode uses two's complement (upper bound)" |
+| 07-len sweep period sync | 2 | Failed #2 "Length period is wrong" |
+| 08-len ctr during power | 1 | Failed; lengths read back `00 00 40 00` (DMG expects `11 22 44 33`) |
+| 09-wave read while on | 1 | Failed; every read returns `FF` |
+| 10-wave trigger while on | 1 | Failed; post-trigger wave-RAM rows differ |
+| 11-regs after power | 4 | Failed #4 "Powering off shouldn't affect NR41" |
+| 12-wave write while on | 1 | Failed; playback-time writes not coupled to the fetch cycle |
+
+The multicart `dmg_sound.gb` runs the same tests and halts on the first
+failing subtest, so it produces no final verdict.
+
 ## Known limitations
 
-* APU: no cycle-exact sweep/envelope/frame-sequencer timing, no stereo.
+* APU: frame sequencer, length/envelope/sweep clocks, DAC gating and NR52
+  power semantics are implemented, but the exact phase of the DMG
+  extra-length clock at step boundaries, the wave-RAM fetch-cycle
+  coupling while channel 3 plays, and a few sweep negate/period-0 edge
+  cases still differ from hardware, which is what the table above
+  measures. No stereo panning in the WAV output.
 * MBC1 in mode-1 high-bit ROM banking, and MBC3 RTC, are stubs.
 * A cartridge with CGB double-speed mode, or the `STOP` instruction, will
   run at DMG speed only (STOP is treated as a short pause).

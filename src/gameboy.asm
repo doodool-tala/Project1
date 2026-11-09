@@ -781,6 +781,7 @@ init_emulator:
     mov word [apu_ch+1*32+14],0x7FFF
     mov word [apu_ch+2*32+14],0x7FFF
     mov word [apu_ch+3*32+14],0x7FFF
+    call apu_init
     ; audio file if requested
     cmp qword [audio_path_ptr],0
     je .noaudio_init
@@ -975,6 +976,11 @@ read_mem:
 .io_r:
     movzx rax,di
     sub rax,0xFF00
+    cmp rax,0x10
+    jb .io_r_plain
+    cmp rax,0x40
+    jb .io_r_apu
+.io_r_plain:
     lea rbx,[io]
     cmp rax,0x40
     je .dma_r
@@ -997,6 +1003,10 @@ read_mem:
     mov eax,[div_counter]
     shr eax,8
     movzx rax,al
+    jmp .out
+.io_r_apu:
+    mov rdi,rax
+    call apu_io_read
     jmp .out
 .hram_r:
     lea rbx,[hram]
@@ -1211,6 +1221,11 @@ write_mem:
 .io_w:
     movzx rax,di
     sub rax,0xFF00
+    cmp rax,0x10
+    jb .io_nonapu
+    cmp rax,0x40
+    jb .io_apu_w
+.io_nonapu:
     lea rbx,[io]
     mov [rbx+rax],dl
     cmp rax,0x04
@@ -1225,7 +1240,8 @@ write_mem:
     je .lcdc_w
     cmp rax,0x00
     je .p1_w
-    ; APU trigger regs: NRx4 (0x14,0x19,0x1E,0x24? actually 0x1E ch3, 0x24) handled in apu_write
+    jmp .out
+.io_apu_w:
     call apu_io_write
     jmp .out
 .div_w:
@@ -1318,7 +1334,9 @@ step_system:
     push r14
     mov r12,rdi
     call step_timer
+    mov rdi,r12
     call step_ppu
+    mov rdi,r12
     call apu_step
     pop r14
     pop r13
@@ -1895,6 +1913,32 @@ set_pixel_from_indextmp:
 section .bss
 instr_cycles: resd 1
 prestep_done: resd 1   ; T-cycles already stepped before handler (intra-instruction timing)
+; ---- APU state ----
+apu_power:      resb 1
+apu_fs_step:    resb 1
+apu_fs_cyc:     resd 1
+apu_active:     resb 4
+apu_dac:        resb 4
+apu_len:        resw 4
+apu_lenen:      resb 4
+apu_frozen:     resb 4
+apu_vol:        resb 4
+apu_envper:     resb 4
+apu_envdir:     resb 4
+apu_envtimer:   resb 4
+apu_freq:       resw 4
+apu_timer:      resd 4
+apu_dutypos:    resb 4
+apu_sweepper:   resb 1
+apu_sweepdir:   resb 1
+apu_sweepshift: resb 1
+apu_sweeptimer: resb 1
+apu_sweepenable: resb 1
+apu_sweepneg:   resb 1
+apu_shadow:     resw 1
+apu_lfsr:       resw 1
+apu_scratch:    resb 4
+apu_entrans:    resb 1
 tmp16: resw 1
 tmp8: resb 1
 section .text
@@ -4447,80 +4491,164 @@ quit_flag_bss: resb 1
 section .text
 ; quit_flag alias: we referenced [quit_flag_bss] in poll/run - it was defined in .text; redirect by equ? Instead patch references via python after.
 ; ---------- APU ----------
-; apu_io_write: rax=io offset (0x00-0x7F), rdx=value
-apu_io_write:
+; Register read masks for NR10..NR52: bits that always read as 1.
+apu_rdmask:
+    db 0x80,0x3F,0x00,0xFF,0xBF
+    db 0xFF,0x3F,0x00,0xFF,0xBF
+    db 0x7F,0xFF,0x9F,0xFF,0xBF
+    db 0xFF,0xFF,0x00,0x00,0xBF
+    db 0x00,0x00,0x70
+    db 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
+duty_tbl: db 0x01,0x81,0x87,0x7E
+
+; apu_init: set DMG post-boot APU state from the initial register values
+apu_init:
     push rbx
     push rcx
     push rdx
-    push rax
-    cmp rax,0x14
-    je .ch1_trig
-    cmp rax,0x19
-    je .ch2_trig
-    cmp rax,0x1E
-    je .ch3_trig
-    cmp rax,0x24
-    je .ch4_trig
-    ; freq low writes update period: ch1 NR13=0x13, ch2 0x18, ch3 0x1D, ch4 0x23
-    cmp rax,0x13
-    je .ch1_freq
-    cmp rax,0x18
-    je .ch2_freq
-    cmp rax,0x1D
-    je .ch3_freq
-    cmp rax,0x23
-    je .ch4_freq
-    jmp .d
-.ch1_trig:
-    test dl,0x80
-    jz .d
-    lea rbx,[apu_ch]
-    mov byte [rbx+0],1
-    mov byte [rbx+1],0
+    push rsi
+    push rdi
+    mov byte [apu_power],1
+    mov byte [apu_fs_step],0
+    mov dword [apu_fs_cyc],0
+    ; length counters: NRx1 load values (max - value)
     movzx eax,byte [io+0x11]
-    mov [rbx+8],al
-    mov byte [rbx+17],0
-    ; if length was 0 set to 64 in io handled by game; ignore
-    jmp .d
-.ch2_trig:
-    test dl,0x80
-    jz .d
-    lea rbx,[apu_ch+32]
-    mov byte [rbx+0],1
-    mov byte [rbx+1],0
-    movzx eax,byte [io+0x19]
-    mov [rbx+8],al
-    jmp .d
-.ch3_trig:
-    test dl,0x80
-    jz .d
-    lea rbx,[apu_ch+64]
-    mov byte [rbx+0],1
-    mov byte [rbx+15],0
-    jmp .d
-.ch4_trig:
-    test dl,0x80
-    jz .d
-    lea rbx,[apu_ch+96]
-    mov byte [rbx+0],1
-    mov word [rbx+14],0x7FFF
-    jmp .d
-.ch1_freq:
-    ; period from NR13 (low) + NR14 high 3 bits - recomputed in apu_step from io directly, nothing needed
-    jmp .d
-.ch2_freq:
-    jmp .d
-.ch3_freq:
-    jmp .d
-.ch4_freq:
-    jmp .d
-.d: pop rax
+    and eax,0x3F
+    mov ecx,64
+    sub ecx,eax
+    mov [apu_len+0],cx
+    movzx eax,byte [io+0x16]
+    and eax,0x3F
+    mov ecx,64
+    sub ecx,eax
+    mov [apu_len+2],cx
+    movzx eax,byte [io+0x1B]
+    mov ecx,256
+    sub ecx,eax
+    mov [apu_len+4],cx
+    movzx eax,byte [io+0x20]
+    and eax,0x3F
+    mov ecx,64
+    sub ecx,eax
+    mov [apu_len+6],cx
+    ; DACs
+    mov al,[io+0x12]
+    test al,0xF8
+    setnz al
+    mov [apu_dac+0],al
+    mov al,[io+0x17]
+    test al,0xF8
+    setnz al
+    mov [apu_dac+1],al
+    mov al,[io+0x1A]
+    shr al,7
+    mov [apu_dac+2],al
+    mov al,[io+0x21]
+    test al,0xF8
+    setnz al
+    mov [apu_dac+3],al
+    ; volumes / envelope config
+    mov al,[io+0x12]
+    mov dl,al
+    shr al,4
+    mov [apu_vol+0],al
+    mov al,dl
+    shr al,3
+    and al,1
+    mov [apu_envdir+0],al
+    mov al,dl
+    and al,7
+    mov [apu_envper+0],al
+    mov al,[io+0x17]
+    mov dl,al
+    shr al,4
+    mov [apu_vol+1],al
+    mov al,dl
+    shr al,3
+    and al,1
+    mov [apu_envdir+1],al
+    mov al,dl
+    and al,7
+    mov [apu_envper+1],al
+    mov al,[io+0x21]
+    mov dl,al
+    shr al,4
+    mov [apu_vol+3],al
+    mov al,dl
+    shr al,3
+    and al,1
+    mov [apu_envdir+3],al
+    mov al,dl
+    and al,7
+    mov [apu_envper+3],al
+    ; sweep config from NR10
+    mov al,[io+0x10]
+    mov dl,al
+    shr al,4
+    and al,7
+    mov [apu_sweepper],al
+    mov al,dl
+    shr al,3
+    and al,1
+    mov [apu_sweepdir],al
+    mov al,dl
+    and al,7
+    mov [apu_sweepshift],al
+    mov byte [apu_sweepenable],0
+    mov byte [apu_sweepneg],0
+    ; channel 1 is active after boot (NR52 = $F1)
+    mov byte [apu_active+0],1
+    mov word [apu_lfsr],0x7FFF
+    pop rdi
+    pop rsi
     pop rdx
     pop rcx
     pop rbx
     ret
-; apu_step(rdi=cycles) - called per instruction; advances timers, envelope/length sequencer approx
-apu_step:
+
+; apu_io_read: rdi = io offset (0x10..0x3F) -> rax
+apu_io_read:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    lea rbx,[io]
+    cmp rdi,0x26
+    je .nr52
+    cmp rdi,0x30
+    jae .wave
+    movzx eax,byte [rbx+rdi]
+    lea rcx,[apu_rdmask]
+    movzx edx,byte [rcx+rdi-0x10]
+    or eax,edx
+    jmp .out
+.nr52:
+    movzx eax,byte [apu_power]
+    shl eax,7
+    or eax,0x70
+    mov edx,[apu_active]
+    and edx,0x0F
+    or eax,edx
+    jmp .out
+.wave:
+    ; DMG: wave RAM is inaccessible while channel 3 plays; reads give $FF
+    cmp byte [apu_active+2],0
+    je .wave_plain
+    cmp byte [apu_dac+2],0
+    je .wave_plain
+    mov eax,0xFF
+    jmp .out
+.wave_plain:
+    movzx eax,byte [rbx+rdi]
+.out:
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; apu_io_write: rax = io offset (0x10..0x3F), rdx = value
+apu_io_write:
     push rbx
     push rcx
     push rdx
@@ -4528,27 +4656,214 @@ apu_step:
     push rdi
     push r12
     push r13
-    add [apu_frame_ctr],edi
-    cmp dword [apu_frame_ctr],8192
-    jb .done
-    mov dword [apu_frame_ctr],0
-    ; frame sequencer tick: length counters and envelope (simplified 512Hz approx)
-    xor r12,r12
-.seq:
-    cmp r12,4
-    jge .done
-    mov rax,r12
-    shl rax,5
-    lea rbx,[apu_ch]
-    add rbx,rax
-    cmp byte [rbx+0],0
-    je .seq_next
-    ; length: if NRx4 len enable bit (io 0x14/0x19 bit6, 0x1E bit6, 0x24 bit6) then decrement stored len (io reg low6)
-    ; simplified: keep channel enabled; envelope handled in sample gen
-.seq_next:
-    inc r12
-    jmp .seq
+    push r14
+    push r15
+    mov r13,rax
+    mov r14b,dl
+    cmp r13,0x30
+    jae .wave
+    cmp r13,0x26
+    je .nr52
+    cmp byte [apu_power],0
+    jne .powered
+    ; while off only NR41 (0x20) stays writable
+    cmp r13,0x20
+    jne .done
+.powered:
+    mov rax,r13
+    sub rax,0x10
+    xor edx,edx
+    mov ecx,5
+    div ecx
+    mov r12,rax              ; channel 0..3
+    mov r15,rdx              ; register index 0..4
+    lea rbx,[io]
+    mov [rbx+r13],r14b
+    cmp r15d,0
+    je .reg0
+    cmp r15d,1
+    je .reg1
+    cmp r15d,2
+    je .reg2
+    cmp r15d,3
+    je .reg3
+    jmp .reg4
+.reg0:
+    cmp r12d,0
+    jne .reg0_ch3
+    ; NR10: sweep period/dir/shift + negate-mode quirk
+    mov al,r14b
+    shr al,3
+    and al,1
+    mov dl,[apu_sweepdir]
+    mov [apu_sweepdir],al
+    test dl,dl
+    jz .nr10_store
+    test al,al
+    jnz .nr10_store
+    cmp byte [apu_sweepneg],0
+    je .nr10_store
+    mov byte [apu_active],0
+.nr10_store:
+    mov al,r14b
+    shr al,4
+    and al,7
+    mov [apu_sweepper],al
+    mov al,r14b
+    and al,7
+    mov [apu_sweepshift],al
+    mov al,[apu_sweepper]
+    or al,[apu_sweepshift]
+    jz .nr10_off
+    mov byte [apu_sweepenable],1
+    jmp .done
+.nr10_off:
+    mov byte [apu_sweepenable],0
+    jmp .done
+.reg0_ch3:
+    ; NR30: wave DAC
+    test r14b,0x80
+    jz .nr30_off
+    mov byte [apu_dac+2],1
+    jmp .done
+.nr30_off:
+    mov byte [apu_dac+2],0
+    mov byte [apu_active+2],0
+    jmp .done
+.reg1:
+    ; length load
+    cmp r12d,2
+    je .len_wave
+    movzx eax,r14b
+    and eax,0x3F
+    mov ecx,64
+    jmp .len_set
+.len_wave:
+    movzx eax,r14b
+    mov ecx,256
+.len_set:
+    sub ecx,eax
+    mov [apu_len+r12*2],cx
+    mov byte [apu_frozen+r12],0
+    jmp .done
+.reg2:
+    cmp r12d,2
+    je .done                 ; NR32: output level, no DAC change
+    mov al,r14b
+    test al,0xF8
+    jz .dac_off
+    mov byte [apu_dac+r12],1
+    jmp .done
+.dac_off:
+    mov byte [apu_dac+r12],0
+    mov byte [apu_active+r12],0
+    jmp .done
+.reg3:
+    cmp r12d,3
+    je .done                 ; NR43 stored only
+    movzx eax,word [apu_freq+r12*2]
+    and eax,0x700
+    movzx edx,r14b
+    or eax,edx
+    mov [apu_freq+r12*2],ax
+    jmp .done
+.reg4:
+    cmp r12d,3
+    je .reg4_len
+    movzx eax,word [apu_freq+r12*2]
+    and eax,0xFF
+    movzx edx,r14b
+    and edx,7
+    shl edx,8
+    or eax,edx
+    mov [apu_freq+r12*2],ax
+.reg4_len:
+    mov byte [apu_entrans],0
+    mov al,r14b
+    and al,0x40
+    mov dl,[apu_lenen+r12]
+    mov [apu_lenen+r12],al
+    test al,al
+    jz .reg4_trig
+    test dl,dl
+    jnz .reg4_trig
+    mov byte [apu_entrans],1
+    ; enable 0->1: extra length clock if next fs step does not clock length
+    test byte [apu_fs_step],1
+    jz .reg4_trig
+    movzx eax,word [apu_len+r12*2]
+    test eax,eax
+    jz .reg4_trig
+    dec eax
+    mov [apu_len+r12*2],ax
+    test eax,eax
+    jnz .reg4_trig
+    test r14b,0x80
+    jnz .reg4_trig
+    mov byte [apu_active+r12],0
+    mov byte [apu_frozen+r12],1
+.reg4_trig:
+    test r14b,0x80
+    jz .done
+    mov rdi,r12
+    call apu_trigger
+    jmp .done
+.wave:
+    ; wave RAM: always writable when ch3 is off; ignored while it plays
+    cmp byte [apu_active+2],0
+    je .wave_store
+    cmp byte [apu_dac+2],0
+    je .wave_store
+    jmp .done
+.wave_store:
+    lea rbx,[io]
+    mov [rbx+r13],r14b
+    jmp .done
+.nr52:
+    test r14b,0x80
+    jz .nr52_off
+    cmp byte [apu_power],0
+    jne .done
+    mov byte [apu_power],1
+    jmp .done
+.nr52_off:
+    cmp byte [apu_power],0
+    je .done
+    mov byte [apu_power],0
+    ; zero NR10..NR51 and all channel state
+    lea rbx,[io]
+    xor ecx,ecx
+.nr52_zero:
+    mov byte [rbx+0x10+rcx],0
+    inc ecx
+    cmp ecx,0x16
+    jb .nr52_zero
+    mov dword [apu_active],0
+    mov dword [apu_dac],0
+    mov dword [apu_lenen],0
+    mov dword [apu_frozen],0
+    mov dword [apu_vol],0
+    mov dword [apu_envper],0
+    mov dword [apu_envdir],0
+    mov dword [apu_envtimer],0
+    mov dword [apu_freq+0],0
+    mov dword [apu_freq+4],0
+    mov dword [apu_timer+0],0
+    mov dword [apu_timer+4],0
+    mov dword [apu_timer+8],0
+    mov dword [apu_timer+12],0
+    mov byte [apu_sweepper],0
+    mov byte [apu_sweepdir],0
+    mov byte [apu_sweepshift],0
+    mov byte [apu_sweepenable],0
+    mov byte [apu_sweepneg],0
+    mov byte [apu_dutypos+0],0
+    mov byte [apu_dutypos+1],0
+    mov byte [apu_dutypos+2],0
+    mov byte [apu_dutypos+3],0
 .done:
+    pop r15
+    pop r14
     pop r13
     pop r12
     pop rdi
@@ -4557,7 +4872,392 @@ apu_step:
     pop rcx
     pop rbx
     ret
-; audio_gen_frame: generate ~738 samples at 44100Hz for one GB frame
+
+; apu_trigger: rdi = channel 0..3
+apu_trigger:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r12
+    push r13
+    mov r12,rdi
+    ; length: 0 becomes maximum; if enabled and next fs step doesn't clock
+    ; length, the reload is decremented (hardware quirk)
+    movzx eax,word [apu_len+r12*2]
+    test eax,eax
+    jnz .trig_len_done
+    mov ecx,64
+    cmp r12d,2
+    jne .trig_max
+    mov ecx,256
+.trig_max:
+    mov eax,ecx
+    cmp byte [apu_entrans],0
+    je .trig_len_set
+    test byte [apu_fs_step],1
+    jz .trig_len_set
+    dec eax
+.trig_len_set:
+    mov [apu_len+r12*2],ax
+.trig_len_done:
+    mov byte [apu_frozen+r12],0
+    ; channel becomes active if its DAC is on
+    cmp byte [apu_dac+r12],0
+    je .trig_dac_done
+    mov byte [apu_active+r12],1
+.trig_dac_done:
+    ; envelope / volume (square and noise channels only)
+    cmp r12d,2
+    je .trig_ch3
+    mov rax,r12
+    imul rax,5
+    lea rbx,[io]
+    movzx edx,byte [rbx+0x12+rax]
+    mov al,dl
+    shr al,4
+    mov [apu_vol+r12],al
+    mov al,dl
+    shr al,3
+    and al,1
+    mov [apu_envdir+r12],al
+    mov al,dl
+    and al,7
+    mov [apu_envper+r12],al
+    test al,al
+    jnz .trig_envt
+    mov al,8
+.trig_envt:
+    mov [apu_envtimer+r12],al
+.trig_ch3:
+    call apu_reload_timer
+    test r12d,r12d
+    jnz .trig_done
+    call apu_sweep_trigger
+.trig_done:
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; apu_reload_timer: r12 = channel; reload its sample timer
+apu_reload_timer:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rax
+    mov rax,r12
+    shl rax,2
+    lea rbx,[apu_timer]
+    cmp r12d,3
+    je .noise
+    movzx edx,word [apu_freq+r12*2]
+    mov ecx,2048
+    sub ecx,edx
+    cmp r12d,2
+    je .wave
+    shl ecx,2
+    mov [rbx+rax],ecx
+    jmp .done
+.wave:
+    shl ecx,1
+    mov [rbx+rax],ecx
+    jmp .done
+.noise:
+    lea rsi,[io]
+    movzx ecx,byte [rsi+0x22]
+    mov edx,ecx
+    and edx,7
+    shr ecx,4
+    test edx,edx
+    jnz .nz
+    mov edx,8
+    jmp .nz2
+.nz:
+    shl edx,4
+.nz2:
+    shl edx,4
+    shl edx,cl
+    mov [rbx+rax],edx
+.done:
+    pop rax
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; apu_sweep_trigger: reload shadow frequency, timer and enable flag, then
+; perform the trigger-time calculation
+apu_sweep_trigger:
+    push rbx
+    push rcx
+    push rdx
+    push rax
+    movzx eax,word [apu_freq]
+    mov [apu_shadow],ax
+    movzx ecx,byte [apu_sweepper]
+    test ecx,ecx
+    jnz .st_timer
+    mov ecx,8
+.st_timer:
+    mov [apu_sweeptimer],cl
+    mov byte [apu_sweepneg],0
+    mov al,[apu_sweepper]
+    or al,[apu_sweepshift]
+    jz .st_off
+    mov byte [apu_sweepenable],1
+    jmp .st_calc
+.st_off:
+    mov byte [apu_sweepenable],0
+.st_calc:
+    cmp byte [apu_sweepshift],0
+    je .st_done
+    call apu_sweep_calc
+.st_done:
+    pop rax
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; apu_sweep_calc: compute new frequency; disable channel on overflow
+apu_sweep_calc:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rax
+    movzx eax,word [apu_shadow]
+    movzx ecx,byte [apu_sweepshift]
+    mov edx,eax
+    shr edx,cl
+    cmp byte [apu_sweepdir],0
+    je .add
+    ; negate mode
+    sub eax,edx
+    mov dl,[apu_sweepneg]
+    mov byte [apu_sweepneg],1
+    test dl,dl
+    jnz .no_ovf
+    jmp .check
+.add:
+    add eax,edx
+    mov byte [apu_sweepneg],0
+.check:
+    cmp eax,0x7FF
+    ja .overflow
+.no_ovf:
+    cmp byte [apu_sweepshift],0
+    je .done
+    mov [apu_shadow],ax
+    mov [apu_freq],ax
+    jmp .done
+.overflow:
+    mov byte [apu_active],0
+.done:
+    pop rax
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; apu_clock_length: 256 Hz length clock
+apu_clock_length:
+    cmp byte [apu_power],0
+    je .off
+    push rbx
+    push rcx
+    push rdx
+    push r12
+    xor r12d,r12d
+.loop:
+    cmp byte [apu_lenen+r12],0
+    je .next
+    cmp byte [apu_frozen+r12],0
+    jne .next
+    movzx eax,word [apu_len+r12*2]
+    test eax,eax
+    jz .next
+    dec eax
+    mov [apu_len+r12*2],ax
+    test eax,eax
+    jnz .next
+    mov byte [apu_active+r12],0
+    mov byte [apu_frozen+r12],1
+.next:
+    inc r12d
+    cmp r12d,4
+    jb .loop
+    pop r12
+    pop rdx
+    pop rcx
+    pop rbx
+.off:
+    ret
+
+; apu_clock_env: 64 Hz volume envelope clock
+apu_clock_env:
+    cmp byte [apu_power],0
+    je .off
+    push rbx
+    push rcx
+    push rdx
+    push r12
+    xor r12d,r12d
+.loop:
+    cmp r12d,2
+    je .next
+    cmp byte [apu_active+r12],0
+    je .next
+    cmp byte [apu_envper+r12],0
+    je .next
+    dec byte [apu_envtimer+r12]
+    jnz .next
+    mov al,[apu_envper+r12]
+    mov [apu_envtimer+r12],al
+    cmp byte [apu_envdir+r12],0
+    jne .up
+    cmp byte [apu_vol+r12],0
+    je .next
+    dec byte [apu_vol+r12]
+    jmp .next
+.up:
+    cmp byte [apu_vol+r12],15
+    jae .next
+    inc byte [apu_vol+r12]
+.next:
+    inc r12d
+    cmp r12d,4
+    jb .loop
+    pop r12
+    pop rdx
+    pop rcx
+    pop rbx
+.off:
+    ret
+
+; apu_clock_sweep: 128 Hz sweep clock
+apu_clock_sweep:
+    cmp byte [apu_power],0
+    je .ret
+    cmp byte [apu_sweepenable],0
+    je .ret
+    dec byte [apu_sweeptimer]
+    jnz .ret
+    mov al,[apu_sweepper]
+    test al,al
+    jnz .reload
+    mov al,8
+.reload:
+    mov [apu_sweeptimer],al
+    cmp byte [apu_sweepper],0
+    je .ret
+    call apu_sweep_calc
+.ret:
+    ret
+
+; apu_step: rdi = elapsed T-cycles
+apu_step:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r14,rdi
+    ; channel sample timers
+    xor r12d,r12d
+.tim_loop:
+    mov eax,[apu_timer+r12*4]
+    test eax,eax
+    jz .tim_next
+    sub eax,r14d
+    cmp eax,0
+    jg .tim_store
+    ; timer expired: advance position, reload period
+    cmp r12d,2
+    je .tim_wave
+    cmp r12d,3
+    je .tim_noise
+    inc byte [apu_dutypos+r12]
+    and byte [apu_dutypos+r12],7
+    jmp .tim_reload
+.tim_wave:
+    inc byte [apu_dutypos+r12]
+    and byte [apu_dutypos+r12],31
+    jmp .tim_reload
+.tim_noise:
+    movzx eax,word [apu_lfsr]
+    mov edx,eax
+    and edx,1
+    shr eax,1
+    xor eax,edx
+    movzx edx,byte [io+0x22]
+    test dl,0x08
+    jz .nshort
+    or eax,0x4000
+.nshort:
+    and eax,0x7FFF
+    mov [apu_lfsr],ax
+.tim_reload:
+    call apu_reload_timer
+    mov eax,[apu_timer+r12*4]
+.tim_store:
+    mov [apu_timer+r12*4],eax
+.tim_next:
+    inc r12d
+    cmp r12d,4
+    jb .tim_loop
+    ; frame sequencer
+    add [apu_fs_cyc],r14d
+.fs_loop:
+    cmp dword [apu_fs_cyc],8192
+    jb .done
+    sub dword [apu_fs_cyc],8192
+    mov al,[apu_fs_step]
+    inc al
+    and al,7
+    mov [apu_fs_step],al
+    test al,1
+    jz .fs_even
+    call apu_clock_length
+    mov al,[apu_fs_step]
+    cmp al,3
+    je .fs_sweep
+    cmp al,7
+    je .fs_sweep
+    jmp .fs_loop
+.fs_even:
+    test al,al
+    jnz .fs_loop
+    call apu_clock_env
+    jmp .fs_loop
+.fs_sweep:
+    call apu_clock_sweep
+    jmp .fs_loop
+.done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
 audio_gen_frame:
     push rbx
     push rcx
@@ -4572,232 +5272,81 @@ audio_gen_frame:
 .gen:
     cmp r12,738
     jge .flush
-    ; step each channel timer by 95 cycles (~44100Hz step)
-    xor r13,r13
-.ch:
-    cmp r13,4
-    jge .mix
-    mov rax,r13
-    shl rax,5
-    lea rbx,[apu_ch]
-    add rbx,rax
-    cmp byte [rbx+0],0
-    je .ch_next
-    add dword [rbx+3],95
-    ; period computed from IO each sample
-    cmp r13,0
-    je .p_ch1
-    cmp r13,1
-    je .p_ch2
-    cmp r13,2
-    je .p_ch3
-    cmp r13,3
-    je .p_ch4
-    jmp .ch_next
-.p_ch1:
-    movzx eax,byte [io+0x13]
-    movzx edx,byte [io+0x14]
-    and edx,7
-    shl edx,8
-    or eax,edx
-    mov [rbx+9],ax
-    shl eax,2     ; *4 cycles per timer tick (freq timer period = (2048-f)*4)
-    cmp dword [rbx+3],eax
-    jb .ch_next
-    mov dword [rbx+3],0
-    inc byte [rbx+1]
-    and byte [rbx+1],7
-    jmp .ch_next
-.p_ch2:
-    movzx eax,byte [io+0x18]
-    movzx edx,byte [io+0x19]
-    and edx,7
-    shl edx,8
-    or eax,edx
-    mov [rbx+9],ax
-    shl eax,2
-    cmp dword [rbx+3],eax
-    jb .ch_next
-    mov dword [rbx+3],0
-    inc byte [rbx+1]
-    and byte [rbx+1],7
-    jmp .ch_next
-.p_ch3:
-    movzx eax,byte [io+0x1D]
-    movzx edx,byte [io+0x1E]
-    and edx,7
-    shl edx,8
-    or eax,edx
-    mov [rbx+9],ax
-    shl eax,1     ; wave timer is *2
-    cmp dword [rbx+3],eax
-    jb .ch_next
-    mov dword [rbx+3],0
-    inc byte [rbx+15]
-    and byte [rbx+15],31
-    jmp .ch_next
-.p_ch4:
-    ; noise period from NR43: freq = NR43>>4, ratio = NR43&7 ; timer = ratio*16 << freq
-    movzx eax,byte [io+0x23]
-    mov edx,eax
-    shr edx,4
-    and edx,7
-    mov ecx,eax
-    and ecx,7
-    mov r8d,ecx
-    shl r8d,4
-    mov ecx,r8d
-    cmp dword [rbx+3],ecx
-    jb .ch_next
-    mov dword [rbx+3],0
-    ; step LFSR
-    movzx eax,word [rbx+14]
-    mov edx,eax
-    and edx,1
-    shr eax,1
-    xor eax,edx
-    movzx edx,byte [io+0x23]
-    test dl,0x10
-    jz .n1
-    or eax,0x0040
-.n1: and eax,0x7FFF
-    mov [rbx+14],ax
-    jmp .ch_next
-.ch_next:
-    inc r13
-    jmp .ch
-.mix:
     xor r14d,r14d
-    xor r13,r13
-.mixch:
-    cmp r13,4
-    jge .store_sample
-    mov rax,r13
-    shl rax,5
-    lea rbx,[apu_ch]
-    add rbx,rax
-    cmp byte [rbx+0],0
-    je .mix_next
-    ; DAC check: NR12 high nibble (ch1/2/4) or NR1A bit7 (ch3)
-    cmp r13,0
-    je .dac12
-    cmp r13,1
-    je .dac12
-    cmp r13,2
-    je .dac3
-    cmp r13,3
-    je .dac12
-    jmp .mix_next
-.dac12:
-    cmp r13,0
-    je .d1
-    cmp r13,1
-    je .d2
-    cmp r13,3
-    je .d4
-    jmp .mix_next
-.d1: movzx eax,byte [io+0x12]
-    jmp .dac_env
-.d2: movzx eax,byte [io+0x17]
-    jmp .dac_env
-.d4: movzx eax,byte [io+0x21]
-    jmp .dac_env
-.dac3:
-    test byte [io+0x1A],0x80
-    jz .mix_next
-    mov eax,0x70
-    jmp .get_sample
-.dac_env:
-    shr eax,4
-    jz .mix_next
-.get_sample:
-    cmp r13,0
-    je .s_sq
-    cmp r13,1
-    je .s_sq
-    cmp r13,2
-    je .s_wave
-    cmp r13,3
-    je .s_noise
-    jmp .mix_next
-.s_sq:
-    movzx edx,byte [rbx+1]
-    ; duty from NR11/NR16 bits 7-6
-    cmp r13,0
-    je .duty1
-    movzx ecx,byte [io+0x16]
-    jmp .duty_ok
-.duty1: movzx ecx,byte [io+0x11]
-.duty_ok:
-    shr ecx,6
-    ; duty patterns: 0: 0xxxxxxx 1: 10000000 2: 11000000 3: 01111111 (inverted)
-    cmp ecx,0
-    je .duty0
-    cmp ecx,1
-    je .duty1p
-    cmp ecx,2
-    je .duty2p
-    ; 3: on when pos >=4
-    cmp edx,4
-    jb .sq_off
-    jmp .sq_on
-.duty0:
-    cmp edx,7
-    jb .sq_off
-    jmp .sq_on
-.duty1p:
-    cmp edx,0
-    je .sq_on
-    jmp .sq_off
-.duty2p:
-    cmp edx,6
-    jb .sq_on
-    jmp .sq_off
-.sq_on:
-    ; volume amplitude: eax = vol (high nibble NR12 etc) * 600
-    ; eax currently envelope vol for sq (from dac_env) - use it
-    mov r15d,eax
-    imul r15d,600
-    add r14d,r15d
-    jmp .mix_next
-.sq_off:
-    mov r15d,eax
-    imul r15d,-600
-    add r14d,r15d
-    jmp .mix_next
-.s_wave:
-    ; wave sample from IO FF30+
-    movzx edx,byte [rbx+15]
-    shr edx,1
-    lea rcx,[io+0x30]
-    movzx eax,byte [rcx+rdx]
-    test byte [rbx+15],1
-    jz .wv_hi
-    and eax,0x0F
-    jmp .wv_val
-.wv_hi:
-    shr eax,4
-.wv_val:
-    shl eax,6
-    sub eax,512
+    xor r13d,r13d
+.sq:
+    cmp r13d,2
+    jge .wavech
+    cmp byte [apu_active+r13],0
+    je .sq_next
+    cmp byte [apu_dac+r13],0
+    je .sq_next
+    mov rcx,r13
+    imul rcx,5
+    lea rbx,[io]
+    movzx edx,byte [rbx+0x11+rcx]
+    shr edx,6
+    lea rsi,[duty_tbl]
+    movzx edx,byte [rsi+rdx]
+    movzx ecx,byte [apu_dutypos+r13]
+    shr edx,cl
+    movzx eax,byte [apu_vol+r13]
+    imul eax,600
+    test dl,1
+    jz .sq_off
     add r14d,eax
-    jmp .mix_next
-.s_noise:
-    movzx eax,word [rbx+14]
+    jmp .sq_next
+.sq_off:
+    sub r14d,eax
+.sq_next:
+    inc r13d
+    jmp .sq
+.wavech:
+    cmp byte [apu_active+2],0
+    je .noisech
+    cmp byte [apu_dac+2],0
+    je .noisech
+    movzx eax,byte [io+0x1C]
+    shr eax,5
+    and eax,3
+    test eax,eax
+    jz .noisech
+    movzx edx,byte [apu_dutypos+2]
+    shr edx,1
+    lea rbx,[io]
+    movzx ecx,byte [rbx+0x30+rdx]
+    test byte [apu_dutypos+2],1
+    jz .w_hi
+    and ecx,0x0F
+    jmp .w_val
+.w_hi:
+    shr ecx,4
+.w_val:
+    cmp eax,1
+    je .w_full
+    cmp eax,2
+    je .w_half
+    sar ecx,2
+    jmp .w_full
+.w_half:
+    sar ecx,1
+.w_full:
+    shl ecx,6
+    sub ecx,512
+    add r14d,ecx
+.noisech:
+    cmp byte [apu_active+3],0
+    je .mix
+    cmp byte [apu_dac+3],0
+    je .mix
+    movzx eax,word [apu_lfsr]
     and eax,1
     jz .n_off
-    mov r15d,800
-    add r14d,r15d
-    jmp .mix_next
+    add r14d,800
+    jmp .mix
 .n_off:
-    mov r15d,-800
-    add r14d,r15d
-    jmp .mix_next
-.mix_next:
-    inc r13
-    jmp .mixch
-.store_sample:
-    ; clamp & store int16
+    sub r14d,800
+.mix:
     cmp r14d,32767
     jle .clamp_lo
     mov r14d,32767
