@@ -141,6 +141,7 @@ cli_debug: resb 1
 debug_count: resq 1
 cli_frames:   resq 1
 cli_serial:   resb 1
+cli_exitres:  resb 1
 rom_fd:    resq 1
 dump_path: resq 1
 dump_len:  resq 1
@@ -173,7 +174,7 @@ audio_path_ptr: dq 0
 rom_path_len: dq 0
 title_buf: times 16 db 0
 palette_rgb: db 228,240,222, 136,192,112, 52,104,86, 12,56,36
-msg_usage: db "Usage: gameboy [--headless] [--frames N] [--dump FILE.ppm] [--serial] [--audio FILE.wav] ROM.gb",10,0
+msg_usage: db "Usage: gameboy [--headless] [--frames N] [--dump FILE.ppm] [--serial] [--audio FILE.wav] [--exit-on-result] ROM.gb",10,0
 msg_openfail: db "gameboy: cannot open ROM",10,0
 msg_noargs: db "gameboy: no ROM given",10,0
 msg_loading: db "Loading: ",0
@@ -383,6 +384,7 @@ _start:
     mov qword [cli_frames],0
     mov byte [cli_headless],0
     mov byte [cli_serial],0
+    mov byte [cli_exitres],0
     mov qword [serial_fd],1
     mov qword [audio_fd],-1
     mov qword [dump_path],0
@@ -427,6 +429,11 @@ _start:
     call strcmp
     test rax,rax
     jz .opt_audio
+    mov rdi,r12
+    lea rsi,[str_exitres]
+    call strcmp
+    test rax,rax
+    jz .set_exitres
     ; else rom path
     mov rax,[rbp+r14*8+8]
     mov [rom_path_str],rax
@@ -444,6 +451,10 @@ _start:
     jmp .parse
 .set_debug:
     mov byte [cli_debug],1
+    inc r14
+    jmp .parse
+.set_exitres:
+    mov byte [cli_exitres],1
     inc r14
     jmp .parse
 .opt_frames:
@@ -554,8 +565,17 @@ str_debug:    db "--debug",0
 str_frames:   db "--frames",0
 str_dump:     db "--dump",0
 str_audio:    db "--audio",0
+str_exitres:  db "--exit-on-result",0
 
 cleanup_and_exit:
+    cmp byte [cli_exitres],0
+    je .noframes
+    mov rax,SYS_write
+    mov edi,2
+    lea rsi,[frames_done]
+    mov edx,8
+    syscall
+.noframes:
     ; save .sav if RAM present
     call save_sav
     ; flush audio
@@ -4067,6 +4087,22 @@ run_emulator:
     jmp .frame_inner
 .frame_done:
     inc qword [frames_done]
+    ; --exit-on-result: stop as soon as the ROM reports a final result
+    ; at $A000 (signature DE B0 61 present, status no longer $80)
+    cmp byte [cli_exitres],0
+    je .after_result
+    cmp dword [ram_banks],0
+    je .after_result
+    cmp byte [extram+1],0xDE
+    jne .after_result
+    cmp byte [extram+2],0xB0
+    jne .after_result
+    cmp byte [extram+3],0x61
+    jne .after_result
+    cmp byte [extram+0],0x80
+    je .after_result
+    jmp .finished
+.after_result:
     call poll_input
     cmp byte [cli_headless],0
     jne .after_display
