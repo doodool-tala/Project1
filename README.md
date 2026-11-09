@@ -141,9 +141,9 @@ re-loaded on the next run.
 
 ## dmg_sound (APU) results
 
-Each single ROM was run headless (2200 frames, well past every subtest)
+Each single ROM was run headless (1500 frames, well past every subtest)
 and its own `$A000` verdict byte, `DE B0 61` signature and text were read
-back. **10 of 12 pass:**
+back. **11 of 12 pass:**
 
 | ROM | status | result |
 | --- | --- | --- |
@@ -151,7 +151,7 @@ back. **10 of 12 pass:**
 | 02-len ctr | 0 | `Passed` |
 | 03-trigger | 0 | `Passed` |
 | 04-sweep | 8 | Failed #8 "If shift=0 and period>0, trigger enables" |
-| 05-sweep details | 8 | Failed #8 "Subtract mode uses two's complement (upper bound)" |
+| 05-sweep details | 0 | `Passed` |
 | 06-overflow on trigger | 0 | `Passed` (`0555 0666 071C 0787 07C1 07E0 07F0 0556 0667 071D 0788 07C2 07E1 07F1`) |
 | 07-len sweep period sync | 0 | `Passed` |
 | 08-len ctr during power | 0 | `Passed`; counter dump `33 44 11 22` (the ROM's own print order) |
@@ -178,9 +178,26 @@ replayed. A register-preserving trace shows the four counters holding
 power-down and zero length clocks while off, and 11 #4 passes because the
 off-state NR41 load survives the power cycle.
 
-What remains is two sweep-calculation subtests (04 #8 and 05 #8): the
-immediate recalculation when NR10 is written with period>0 and shift>0,
-and the negate-mode upper bound.
+The sweep unit follows the rule the ROM states in test 09's own title,
+"Update channel frequency only when period is reloaded": a calculation
+moves only the private shadow frequency, and NR13/NR14 are updated from
+that shadow when the sweep timer reloads with a non-zero period.
+Register-preserving traces show why this is what 05 #7/#8 need: the second
+trigger copies `$555`/`$556` (giving `$7FF`, stays on, and `$801`,
+disabled) instead of the already-swept `$500`/`$501`. 05 now prints
+`Passed` with status 0.
+
+Instrumentation also rules out a phase error in the clock: sweep ticks
+occur at frame-sequencer steps 2 and 6 with the timer reloaded from the
+period register (`F 02 ... 01 01 ...`, `F 06 ... 01 01 ...`), four steps =
+32768 cycles = 128 Hz apart and DIV-aligned, while `delay_apu 1` samples
+are two steps apart. What remains is 04 #8: after `NR10=$11` the shadow
+becomes `$5FE` only on the step-2 tick, and the overflow to `$8FD` lands
+on the step-6 tick, three steps after the ROM's final sample. Making NR10
+writes calculate immediately closes 04 #8 and #9 (04 then reaches #10) but
+disables a channel 04 #10 requires to stay on, so that variant was
+measured, rejected and reverted; a 28-way sweep of init-gate, init-source
+and reload-update combinations found no variant passing both 04 and 05.
 
 The multicart `dmg_sound.gb` runs each test at four alignments. After
 12000 headless frames its `$A000` status is still `80` (running), and
@@ -191,20 +208,21 @@ every fourth run is `ok` while the others fail at subtest 8:
 13:ok 14:ok 15:ok 16:08 17:ok 18:ok 19:ok 20:08 21:ok 22:ok 23:ok 24:08
 ```
 
-That is the same sweep edge case as 04 #8 / 05 #8, so the multicart has no
-final verdict yet.
+That is the same sweep edge case as 04 #8, so the multicart has no final
+verdict yet (status remains `$80` after 12000 headless frames).
 
 ## Known limitations
 
 * APU: frame sequencer, length/envelope/sweep clocks, DAC gating, NR52
   power semantics, wave-RAM read/write gating and the DMG trigger
-  corruption are implemented and measured (10/12 `dmg_sound` singles
-  pass, including all four wave ROMs, both length-counter/power ROMs and
-  the trigger ROM). Still wrong: two sweep-calculation subtests
-  (04 #8 "If shift=0 and period>0, trigger enables" and 05 #8 "Subtract
-  mode uses two's complement (upper bound)") - the immediate NR10
-  recalculation and the negate-mode upper bound - which is also why the
-  multicart has no final verdict. No stereo panning in the WAV output.
+  corruption are implemented and measured (11/12 `dmg_sound` singles
+  pass, including all four wave ROMs, both length-counter/power ROMs, the
+  trigger ROM and 05-sweep-details' negate-mode bounds). Still wrong: one
+  sweep-calculation subtest, 04 #8 "If shift=0 and period>0, trigger
+  enables", whose overflow tick lands three frame-sequencer steps after
+  the ROM's final sample; the multicart consequently has no final verdict
+  (`$A000` is still `$80` after 12000 headless frames). No stereo panning
+  in the WAV output.
 * MBC1 in mode-1 high-bit ROM banking, and MBC3 RTC, are stubs.
 * A cartridge with CGB double-speed mode, or the `STOP` instruction, will
   run at DMG speed only (STOP is treated as a short pause).

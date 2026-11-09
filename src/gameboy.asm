@@ -5189,7 +5189,6 @@ apu_sweep_calc:
     cmp byte [apu_sweepshift],0
     je .done
     mov [apu_shadow],ax
-    mov [apu_freq],ax
     jmp .done
 .overflow:
     mov byte [apu_active],0
@@ -5292,6 +5291,10 @@ apu_clock_sweep:
     mov [apu_sweeptimer],al
     cmp byte [apu_sweepper],0
     je .ret
+    ; the sweep calculation only moves the private shadow value; the
+    ; frequency registers are updated when the timer reloads (period != 0)
+    mov ax,[apu_shadow]
+    mov [apu_freq],ax
     call apu_sweep_calc
 .ret:
     ret
