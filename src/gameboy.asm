@@ -103,6 +103,7 @@ stop_flag: resb 1
 rom_ptr: resq 1
 rom_size: resq 1
 rom_banks: resd 1
+rom_mask:  resd 1      ; rom_banks-1, bank alias mask
 mbc_type: resb 1
 mbc_rom_bank: resd 1      ; low 5 bits (mbc1) / full (mbc5)
 mbc_ram_bank: resd 1
@@ -707,6 +708,9 @@ init_emulator:
     mov eax,2
 .banks_ok:
     mov [rom_banks],eax
+    mov ecx,eax
+    dec ecx
+    mov [rom_mask],ecx
     mov al,[rsi+0x149]
     cmp al,0
     je .ram0
@@ -943,6 +947,9 @@ read_mem:
     mov ecx,1
     jmp .rom_banked
 .rom_banked:
+    ; hardware aliases out-of-range banks by ROM size (MBC1's 0->1
+    ; substitution above applies to the 5-bit register, before aliasing)
+    and ecx,[rom_mask]
     shl rcx,14
     add rbx,rcx
     mov al,[rbx+rax-0x4000]
