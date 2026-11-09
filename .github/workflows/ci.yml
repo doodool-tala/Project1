@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  deterministic:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm binutils ffmpeg
+      - name: Build
+        run: make
+      - name: Deterministic tests
+        run: make test
+
+  blargg:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm binutils ffmpeg curl
+      - name: Build
+        run: make
+      - name: Fetch public Blargg test ROMs
+        run: make fetch-blargg
+      - name: Blargg singles
+        run: make test-blargg

@@ -3,7 +3,7 @@
 ;  Crouton Alpha - no C, no libc, no libraries. Linux syscalls only.
 ;  Assembles with NASM:  nasm -f elf64 -o gameboy.o src/gameboy.asm && ld -o gameboy gameboy.o
 ;  Usage: ./gameboy [--headless] [--frames N] [--dump FILE.ppm] [--serial] [--audio FILE.wav] ROM.gb
-;  Terminal mode: raw keyboard - Arrows/WASD=D-pad  Z=B  X=A  Enter=Start  Shift=Select  Esc=quit
+;  Terminal mode: raw keyboard - Arrows/WASD=D-pad  Z=B  X=A  Enter=Start  Space=Select  Esc=quit
 ;  Implements: full LR35902 CPU (+CB), PPU (BG/Window/Sprites, STAT, modes 0-3),
 ;  DIV/TIMA timers, serial, joypad, APU (4ch square/wave/noise -> WAV), MBC1/3/5+RAM, echo RAM, HRAM, DMA.
 ; ============================================================================
@@ -105,13 +105,17 @@ rom_size: resq 1
 rom_banks: resd 1
 rom_mask:  resd 1      ; rom_banks-1, bank alias mask
 mbc_type: resb 1
-mbc_rom_bank: resd 1      ; low 5 bits (mbc1) / full (mbc5)
+mbc_family: resb 1        ; 0 ROM-only, 1 MBC1, 3 MBC3, 5 MBC5
+mbc_rom_bank: resd 1      ; low 5 bits (mbc1) / full 9 bits (mbc5)
 mbc_ram_bank: resd 1
-mbc_mode: resb 1
+mbc_mode: resb 1          ; MBC1 mode (0/1)
+mbc1_hi: resb 1           ; MBC1 2-bit bank/mode register
+ram_enable: resb 1        ; MBC1/3/5 external RAM enable
+ram_mask: resd 1          ; ram_banks-1
 ram_banks: resd 1
 vram:    resb 0x2000
 wram:    resb 0x2000
-extram:  resb 0x8000      ; 4 x 8K MBC RAM banks
+extram:  resb 0x20000     ; 16 x 8K MBC RAM banks (MBC5 can select 16)
 oam:     resb 0xA0
 io:      resb 0x80        ; FF00-FF7F
 hram:    resb 0x7F        ; FF80-FFFE
@@ -123,6 +127,11 @@ ppu_dot: resw 1
 ppu_ly:  resb 1
 ppu_mode: resb 1
 stat_prev: resb 1
+; per-scanline pixel state used by the sprite compositor
+bg_line_idx:  resb 160
+spr_line_col: resb 160
+spr_line_attr: resb 160
+spr_line_x:   resb 160
 ; Timer
 div_counter: resd 1
 tima_counter: resd 1
@@ -136,6 +145,7 @@ key_a:     resb 1
 key_b:     resb 1
 key_start: resb 1
 key_select: resb 1
+p1_old:    resb 1        ; selected P1 lines before the latest key poll
 ; CLI / runtime
 cli_headless: resb 1
 cli_debug: resb 1
@@ -143,6 +153,7 @@ debug_count: resq 1
 cli_frames:   resq 1
 cli_serial:   resb 1
 cli_exitres:  resb 1
+cli_verdict:  resb 1
 rom_fd:    resq 1
 dump_path: resq 1
 dump_len:  resq 1
@@ -150,6 +161,8 @@ audio_fd:  resq 1
 audio_enabled: resb 1
 audio_buf: resb 16384
 audio_buf_len: resq 1
+audio_accum: resq 1       ; cycles * 44100 fixed point
+audio_bytes: resq 1       ; PCM bytes written (for the RIFF header)
 serial_fd: resq 1   ; fd to write serial bytes (1)
 saved_termios: resb 64
 termios_raw: resb 64
@@ -175,14 +188,26 @@ audio_path_ptr: dq 0
 rom_path_len: dq 0
 title_buf: times 16 db 0
 palette_rgb: db 228,240,222, 136,192,112, 52,104,86, 12,56,36
-msg_usage: db "Usage: gameboy [--headless] [--frames N] [--dump FILE.ppm] [--serial] [--audio FILE.wav] [--exit-on-result] ROM.gb",10,0
+; 44-byte canonical PCM WAV header; sizes at +4 and +40 are patched on close
+align 4
+wav_header:
+    db "RIFF",0,0,0,0,"WAVE","fmt ",16,0,0,0,1,0,1,0
+    dd 44100
+    dd 88200
+    dw 2,16
+    db "data",0,0,0,0
+msg_usage: db "Usage: gameboy [--headless] [--frames N] [--dump FILE.ppm] [--serial] [--audio FILE.wav] [--exit-on-result] [--verdict] ROM.gb",10,0
 msg_openfail: db "gameboy: cannot open ROM",10,0
+msg_badrom: db "gameboy: invalid ROM size (need 32 KiB..8 MiB)",10,0
+msg_badpath: db "gameboy: ROM path too long",10,0
+msg_readfail: db "gameboy: short read",10,0
+msg_verdict: db "VERDICT ",0
 msg_noargs: db "gameboy: no ROM given",10,0
 msg_loading: db "Loading: ",0
 msg_title: db " Title: ",0
 msg_mbc: db " MBC type: ",0
 msg_newline: db 10,0
-msg_booted: db "Booted. Terminal: arrows/WASD D-pad, Z=B X=A Enter=Start Shift=Select Esc=quit",10,0
+msg_booted: db "Booted. Terminal: arrows/WASD D-pad, Z=B X=A Enter=Start Space=Select Esc=quit",10,0
 dbg_colon: db ":",0
 dbg_nl: db 10,0
 esc_hide: db 27,"[?25l",27,"[2J",27,"[H",0
@@ -386,6 +411,7 @@ _start:
     mov byte [cli_headless],0
     mov byte [cli_serial],0
     mov byte [cli_exitres],0
+    mov byte [cli_verdict],0
     mov qword [serial_fd],1
     mov qword [audio_fd],-1
     mov qword [dump_path],0
@@ -435,10 +461,17 @@ _start:
     call strcmp
     test rax,rax
     jz .set_exitres
+    mov rdi,r12
+    lea rsi,[str_verdict]
+    call strcmp
+    test rax,rax
+    jz .set_verdict
     ; else rom path
     mov rax,[rbp+r14*8+8]
     mov [rom_path_str],rax
     call strlen
+    cmp rax,500
+    ja .badpath
     mov [rom_path_len],rax
     inc r14
     jmp .parse
@@ -456,6 +489,10 @@ _start:
     jmp .parse
 .set_exitres:
     mov byte [cli_exitres],1
+    inc r14
+    jmp .parse
+.set_verdict:
+    mov byte [cli_verdict],1
     inc r14
     jmp .parse
 .opt_frames:
@@ -504,6 +541,13 @@ _start:
     syscall
     cmp rax,0
     jle .openfail
+    ; A cartridge is at least two 16 KiB banks and at most 8 MiB.
+    ; Rejecting other sizes here keeps every later bank/read access in
+    ; the mapping we actually allocated.
+    cmp rax,0x8000
+    jb .badrom
+    cmp rax,0x800000
+    ja .badrom
     mov [rom_size],rax
     ; align up to page
     mov rcx,rax
@@ -543,6 +587,8 @@ _start:
     sub r13,rax
     jmp .rd
 .rdone:
+    test r13,r13
+    jnz .shortread
     mov rax,SYS_close
     mov rdi,[rom_fd]
     syscall
@@ -560,6 +606,21 @@ _start:
     lea rdi,[msg_openfail]
     call prints0
     EXIT 1
+.badrom:
+    lea rdi,[msg_badrom]
+    call prints0
+    EXIT 1
+.badpath:
+    lea rdi,[msg_badpath]
+    call prints0
+    EXIT 1
+.shortread:
+    mov rax,SYS_close
+    mov rdi,[rom_fd]
+    syscall
+    lea rdi,[msg_readfail]
+    call prints0
+    EXIT 1
 str_headless: db "--headless",0
 str_serial:   db "--serial",0
 str_debug:    db "--debug",0
@@ -567,6 +628,7 @@ str_frames:   db "--frames",0
 str_dump:     db "--dump",0
 str_audio:    db "--audio",0
 str_exitres:  db "--exit-on-result",0
+str_verdict:  db "--verdict",0
 
 cleanup_and_exit:
     cmp byte [cli_exitres],0
@@ -577,17 +639,24 @@ cleanup_and_exit:
     mov edx,8
     syscall
 .noframes:
+    ; --verdict: expose the cartridge-RAM result byte for automated suites.
+    cmp byte [cli_verdict],0
+    je .noverdict
+    cmp dword [ram_banks],0
+    je .noverdict
+    lea rdi,[msg_verdict]
+    call prints0
+    movzx rax,byte [extram]
+    call print_hex8
+    lea rdi,[msg_newline]
+    call prints0
+.noverdict:
     ; save .sav if RAM present
     call save_sav
-    ; flush audio
+    ; flush and finalize audio (patch RIFF/data sizes, then close)
     cmp byte [audio_enabled],0
     je .noaudio
-    call audio_flush
-    cmp qword [audio_fd],0
-    jl .noaudio
-    mov rax,SYS_close
-    mov rdi,[audio_fd]
-    syscall
+    call audio_finalize
 .noaudio:
     cmp byte [cli_headless],0
     jne .skip_term
@@ -610,6 +679,8 @@ save_sav:
     lea rdi,[sav_path]
     mov rsi,[rom_path_str]
     mov rcx,[rom_path_len]
+    cmp rcx,500
+    ja .d
     mov rdx,0
 .cp: cmp rdx,rcx
     jge .cpd
@@ -647,6 +718,8 @@ load_sav:
     lea rdi,[sav_path]
     mov rsi,[rom_path_str]
     mov rcx,[rom_path_len]
+    cmp rcx,500
+    ja .d
     mov rdx,0
 .cp: cmp rdx,rcx
     jge .cpd
@@ -699,21 +772,57 @@ init_emulator:
     mov rsi,[rom_ptr]
     mov al,[rsi+0x147]
     mov [mbc_type],al
-    mov al,[rsi+0x148]
-    movzx rax,al
-    mov rcx,2
-    shl rax,cl
-    cmp eax,0
-    jne .banks_ok
+    ; Cartridge families, not individual type bytes: 0x01-0x03 are MBC1,
+    ; 0x0F-0x13 are MBC3 (so 0x11/0x12 are NOT MBC1), 0x19-0x1E MBC5.
+    xor ecx,ecx
+    mov dl,al
+    cmp dl,0x01
+    jb .fam_done
+    cmp dl,0x03
+    jbe .fam1
+    cmp dl,0x0F
+    jb .fam_done
+    cmp dl,0x13
+    jbe .fam3
+    cmp dl,0x19
+    jb .fam_done
+    cmp dl,0x1E
+    jbe .fam5
+    jmp .fam_done
+.fam1: mov ecx,1
+    jmp .fam_done
+.fam3: mov ecx,3
+    jmp .fam_done
+.fam5: mov ecx,5
+.fam_done:
+    mov [mbc_family],cl
+    ; ROM size code 0..8 means 2..512 banks. Clamp the header claim to the
+    ; real file size so a malformed or truncated header can never index
+    ; past the mapping.
+    movzx eax,byte [rsi+0x148]
+    cmp eax,8
+    jbe .rom_code_ok
+    mov eax,8
+.rom_code_ok:
+    mov ecx,eax
     mov eax,2
+    shl eax,cl
+    mov rdx,[rom_size]
+    shr rdx,14
+    cmp rdx,2
+    jae .actual_banks
+    mov rdx,2
+.actual_banks:
+    cmp rax,rdx
+    jbe .banks_ok
+    mov rax,rdx
 .banks_ok:
     mov [rom_banks],eax
-    mov ecx,eax
-    dec ecx
-    mov [rom_mask],ecx
+    dec eax
+    mov [rom_mask],eax
+    ; RAM size: 00 none, 01 2K, 02 8K, 03 32K, 04 128K, 05 64K.
     mov al,[rsi+0x149]
-    cmp al,0
-    je .ram0
+    xor ecx,ecx
     cmp al,1
     je .ram1
     cmp al,2
@@ -721,17 +830,29 @@ init_emulator:
     cmp al,3
     je .ram4
     cmp al,4
-    je .ram4
+    je .ram16
     cmp al,5
-    je .ram4
-    mov dword [ram_banks],1
+    je .ram8
     jmp .ramdone
-.ram0: mov dword [ram_banks],0
+.ram1: mov ecx,1
     jmp .ramdone
-.ram1: mov dword [ram_banks],1
+.ram4: mov ecx,4
     jmp .ramdone
-.ram4: mov dword [ram_banks],4
+.ram8: mov ecx,8
+    jmp .ramdone
+.ram16: mov ecx,16
 .ramdone:
+    mov [ram_banks],ecx
+    test ecx,ecx
+    jz .rammask_done
+    dec ecx
+.rammask_done:
+    mov [ram_mask],ecx
+    mov dword [mbc_rom_bank],1
+    mov dword [mbc_ram_bank],0
+    mov byte [mbc_mode],0
+    mov byte [mbc1_hi],0
+    mov byte [ram_enable],0
     ; post-boot registers (Pan Docs)
     mov byte [gb_a],0x01
     mov byte [gb_f],0xB0
@@ -867,7 +988,11 @@ init_emulator:
 audio_write_header:
     push rbx
     push r12
-    ; RIFF header 44 bytes, data size 0xFFFFFFF0 placeholder updated? keep large, players handle
+    ; Reserve 44 bytes; the real RIFF/data sizes are patched by
+    ; audio_finalize after all PCM has been written.
+    mov qword [audio_bytes],0
+    mov dword [wav_header+4],0
+    mov dword [wav_header+40],0
     mov rdi,[audio_fd]
     lea rsi,[wav_header]
     mov rdx,44
@@ -875,13 +1000,6 @@ audio_write_header:
     pop r12
     pop rbx
     ret
-wav_header:
-    db "RIFF",0xF0,0xFF,0xFF,0x7F,"WAVE","fmt ",16,0,0,0, 1,0, 1,0
-    dd 44100
-    dd 88200
-    dw 2,16
-    dw 0
-    db "data",0xD0,0xFF,0xFF,0x7F
 
 ; ---------- memory read: rdi=addr(0-FFFF) -> al ----------
 read_mem:
@@ -915,46 +1033,41 @@ read_mem:
     movzx rax,di
     cmp di,0x4000
     jb .rom0
-    ; banked
     mov rbx,[rom_ptr]
-    mov ecx,[mbc_rom_bank]
-    cmp byte [mbc_type],0x13
-    je .mbc3bank
-    cmp byte [mbc_type],0x01
-    je .mbc1bank
-    cmp byte [mbc_type],0x02
-    je .mbc1bank
-    cmp byte [mbc_type],0x03
-    je .mbc1bank
-    cmp byte [mbc_type],0x11
-    je .mbc1bank
-    cmp byte [mbc_type],0x12
-    je .mbc1bank
-    cmp byte [mbc_type],0x19
-    je .mbc5bank
-    cmp byte [mbc_type],0x1A
-    je .mbc5bank
-    cmp byte [mbc_type],0x1B
-    je .mbc5bank
-    ; ROM only / unknown: bank 1
     mov ecx,1
-    jmp .rom_banked
-.mbc3bank:
-    and ecx,0x7F
+    cmp byte [mbc_family],1
+    je .mbc1bank
+    cmp byte [mbc_family],3
+    je .mbc3bank
+    cmp byte [mbc_family],5
+    je .mbc5bank
     jmp .rom_banked
 .mbc1bank:
+    ; MBC1 zero-to-one substitution applies to the 5-bit register, then
+    ; mode 1 adds the 2-bit high register.
+    mov ecx,[mbc_rom_bank]
     and ecx,0x1F
+    jnz .mbc1_low_ok
+    mov ecx,1
+.mbc1_low_ok:
+    cmp byte [mbc_mode],0
+    je .rom_banked
+    movzx edx,byte [mbc1_hi]
+    shl edx,5
+    or ecx,edx
+    jmp .rom_banked
+.mbc3bank:
+    mov ecx,[mbc_rom_bank]
+    and ecx,0x7F
     jnz .rom_banked
     mov ecx,1
     jmp .rom_banked
 .mbc5bank:
+    ; MBC5 has a 9-bit bank register and bank 0 is legal.
+    mov ecx,[mbc_rom_bank]
     and ecx,0x1FF
-    jnz .rom_banked
-    mov ecx,1
-    jmp .rom_banked
 .rom_banked:
-    ; hardware aliases out-of-range banks by ROM size (MBC1's 0->1
-    ; substitution above applies to the 5-bit register, before aliasing)
+    ; Aliasing by the real ROM size (header claim already clamped).
     and ecx,[rom_mask]
     shl rcx,14
     add rbx,rcx
@@ -963,6 +1076,22 @@ read_mem:
     jmp .out
 .rom0:
     mov rbx,[rom_ptr]
+    ; MBC1 mode 1 maps the 0x0000-0x3FFF window with the high register.
+    cmp byte [mbc_family],1
+    jne .rom0_bank0
+    cmp byte [mbc_mode],0
+    je .rom0_bank0
+    movzx ecx,byte [mbc1_hi]
+    shl ecx,5
+    test ecx,ecx
+    jz .rom0_bank0
+    and ecx,[rom_mask]
+    shl rcx,14
+    add rbx,rcx
+    mov al,[rbx+rax]
+    movzx rax,al
+    jmp .out
+.rom0_bank0:
     mov al,[rbx+rax]
     movzx rax,al
     jmp .out
@@ -974,10 +1103,31 @@ read_mem:
     movzx rax,al
     jmp .out
 .extram_r:
+    cmp byte [ram_enable],0
+    je .zero
     cmp dword [ram_banks],0
     je .zero
+    ; MBC3 RTC registers 0x08-0x0C are a stub, but must not alias RAM.
+    cmp byte [mbc_family],3
+    jne .extram_r_bank
+    cmp dword [mbc_ram_bank],8
+    jb .extram_r_bank
+    mov al,0xFF
+    movzx rax,al
+    jmp .out
+.extram_r_bank:
     lea rbx,[extram]
     mov ecx,[mbc_ram_bank]
+    ; MBC1: in mode 1 the 2-bit high register selects the RAM bank;
+    ; in mode 0 RAM bank 0 is always selected.
+    cmp byte [mbc_family],1
+    jne .extram_r_select
+    xor ecx,ecx
+    cmp byte [mbc_mode],0
+    je .extram_r_select
+    movzx ecx,byte [mbc1_hi]
+.extram_r_select:
+    and ecx,[ram_mask]
     movzx rax,di
     sub rax,0xA000
     shl rcx,13
@@ -1021,7 +1171,15 @@ read_mem:
     je .p1_r
     cmp rax,0x04
     je .div_r
+    cmp rax,0x0F
+    je .if_r
     mov al,[rbx+rax]
+    movzx rax,al
+    jmp .out
+.if_r:
+    mov al,[rbx+0x0F]
+    and al,0x1F
+    or al,0xE0
     movzx rax,al
     jmp .out
 .dma_r:
@@ -1082,19 +1240,20 @@ read_p1: ; -> al (bit6/5 select, low nibble: 1=pressed -> 0)
 .skip_dpad:
     test al,0x20
     jnz .skip_btn
-    test byte [key_start],1
-    jz .ns
-    and ah,~0x01
-.ns: test byte [key_select],1
-    jz .nse
-    and ah,~0x02
-.nse: test byte [key_b],1
-    jz .nb
-    and ah,~0x04
-.nb: test byte [key_a],1
+    ; Button group: bit0=A, bit1=B, bit2=Select, bit3=Start.
+    test byte [key_a],1
     jz .na
+    and ah,~0x01
+.na: test byte [key_b],1
+    jz .nb
+    and ah,~0x02
+.nb: test byte [key_select],1
+    jz .nse
+    and ah,~0x04
+.nse: test byte [key_start],1
+    jz .ns
     and ah,~0x08
-.na:
+.ns:
 .skip_btn:
     or al,ah
     or al,0xC0
@@ -1129,110 +1288,99 @@ write_mem:
     mov [ie_reg],dl
     jmp .out
 .rom_w:
-    ; MBC control
+    ; MBC control register ranges: 0000-1FFF RAM enable, 2000-3FFF ROM
+    ; bank, 4000-5FFF high/RAM bank, 6000-7FFF mode/latch.
     cmp di,0x2000
-    jb .out
+    jb .mbc_enable_w
     cmp di,0x4000
     jb .mbc_rombank_w
     cmp di,0x6000
-    jb .mbc_mode_w
+    jb .mbc_hi_w
     cmp di,0x8000
-    jb .mbc_rambank_w
+    jb .mbc_extra_w
+    jmp .out
+.mbc_enable_w:
+    cmp byte [mbc_family],0
+    je .out
+    mov eax,edx
+    and eax,0x0F
+    cmp eax,0x0A
+    sete al
+    movzx eax,al
+    mov [ram_enable],al
     jmp .out
 .mbc_rombank_w:
-    cmp byte [mbc_type],0x13
+    cmp byte [mbc_family],1
+    je .mbc1_rom
+    cmp byte [mbc_family],3
     je .mbc3_rom
-    cmp byte [mbc_type],0x01
-    je .mbc1_rom
-    cmp byte [mbc_type],0x02
-    je .mbc1_rom
-    cmp byte [mbc_type],0x03
-    je .mbc1_rom
-    cmp byte [mbc_type],0x11
-    je .mbc1_rom
-    cmp byte [mbc_type],0x12
-    je .mbc1_rom
-    cmp byte [mbc_type],0x19
+    cmp byte [mbc_family],5
     je .mbc5_rom
-    cmp byte [mbc_type],0x1A
-    je .mbc5_rom
-    cmp byte [mbc_type],0x1B
-    je .mbc5_rom
-    jmp .out
-.mbc3_rom:
-    mov eax,edx
-    and eax,0x7F
-    jz .mbc3_zero
-    mov [mbc_rom_bank],eax
-    jmp .out
-.mbc3_zero:
-    mov dword [mbc_rom_bank],0
     jmp .out
 .mbc1_rom:
     mov eax,edx
     and eax,0x1F
-    ; preserve high bits in mode? ignore high for ROM bank (mode0 = 5-bit)
+    mov [mbc_rom_bank],eax
+    jmp .out
+.mbc3_rom:
+    mov eax,edx
+    and eax,0x7F
+    jnz .mbc3_rom_store
+    mov eax,1
+.mbc3_rom_store:
     mov [mbc_rom_bank],eax
     jmp .out
 .mbc5_rom:
-    ; low 8 bits at 2000-3FFF, high at 6000 is handled separately below as rombank high - simplified: use full low
+    ; 2000-2FFF is the low 8 bits, 3000-3FFF is bit 8. Bank 0 is legal.
+    cmp di,0x3000
+    jb .mbc5_rom_low
+    movzx ecx,dl
+    and ecx,1
+    shl ecx,8
+    and dword [mbc_rom_bank],0xFF
+    or dword [mbc_rom_bank],ecx
+    jmp .out
+.mbc5_rom_low:
+    movzx ecx,dl
+    and dword [mbc_rom_bank],0x100
+    or dword [mbc_rom_bank],ecx
+    jmp .out
+.mbc_hi_w:
+    cmp byte [mbc_family],1
+    je .mbc1_hi_w
+    cmp byte [mbc_family],3
+    je .mbc3_hi_w
+    cmp byte [mbc_family],5
+    je .mbc5_hi_w
+    jmp .out
+.mbc1_hi_w:
     mov eax,edx
-    mov [mbc_rom_bank],eax
+    and eax,3
+    mov [mbc1_hi],al
     jmp .out
-.mbc_mode_w:
-    cmp byte [mbc_type],0x01
-    je .setmode
-    cmp byte [mbc_type],0x02
-    je .setmode
-    cmp byte [mbc_type],0x03
-    je .setmode
-    cmp byte [mbc_type],0x11
-    je .setmode
-    cmp byte [mbc_type],0x12
-    je .setmode
+.mbc3_hi_w:
+    movzx eax,dl
+    cmp eax,0x08
+    jb .mbc3_ram_sel
+    cmp eax,0x0C
+    ja .out
+    mov [mbc_ram_bank],eax     ; RTC selector, stubbed
     jmp .out
-.setmode:
-    mov [mbc_mode],dl
-    jmp .out
-.mbc_rambank_w:
-    cmp byte [mbc_type],0x13
-    je .mbc3_ram
-    cmp byte [mbc_type],0x01
-    je .mbc1_ram
-    cmp byte [mbc_type],0x02
-    je .mbc1_ram
-    cmp byte [mbc_type],0x03
-    je .mbc1_ram
-    cmp byte [mbc_type],0x11
-    je .mbc1_ram
-    cmp byte [mbc_type],0x12
-    je .mbc1_ram
-    cmp byte [mbc_type],0x19
-    je .mbc5_ram
-    cmp byte [mbc_type],0x1A
-    je .mbc5_ram
-    cmp byte [mbc_type],0x1B
-    je .mbc5_ram
-    jmp .out
-.mbc3_ram:
-    mov eax,edx
-    cmp eax,0x0A
-    jb .mbc3_ram_std
-    ; RTC regs 0A-0D ignored except store in extram area? ignore
-    jmp .out
-.mbc3_ram_std:
+.mbc3_ram_sel:
     and eax,3
     mov [mbc_ram_bank],eax
     jmp .out
-.mbc1_ram:
-    mov eax,edx
-    and eax,3
-    mov [mbc_ram_bank],eax
-    jmp .out
-.mbc5_ram:
-    mov eax,edx
+.mbc5_hi_w:
+    movzx eax,dl
     and eax,0x0F
     mov [mbc_ram_bank],eax
+    jmp .out
+.mbc_extra_w:
+    cmp byte [mbc_family],1
+    jne .out                    ; MBC3 latch / MBC5 unused here
+    mov eax,edx
+    and eax,1
+    mov [mbc_mode],al
     jmp .out
 .vram_w:
     lea rbx,[vram]
@@ -1241,10 +1389,25 @@ write_mem:
     mov [rbx+rax],dl
     jmp .out
 .extram_w:
+    cmp byte [ram_enable],0
+    je .out
     cmp dword [ram_banks],0
     je .out
+    cmp byte [mbc_family],3
+    jne .extram_w_bank
+    cmp dword [mbc_ram_bank],8
+    jae .out                   ; RTC register write (stub)
+.extram_w_bank:
     lea rbx,[extram]
     mov ecx,[mbc_ram_bank]
+    cmp byte [mbc_family],1
+    jne .extram_w_select
+    xor ecx,ecx
+    cmp byte [mbc_mode],0
+    je .extram_w_select
+    movzx ecx,byte [mbc1_hi]
+.extram_w_select:
+    and ecx,[ram_mask]
     movzx rax,di
     sub rax,0xA000
     shl rcx,13
@@ -1300,15 +1463,13 @@ write_mem:
     mov byte [prev_tac_bit],0
     jmp .out
 .if_w:
-    mov [if_reg],dl
+    and byte [rbx+0x0F],0x1F
+    mov al,[rbx+0x0F]
+    mov [if_reg],al
     jmp .out
 .p1_w:
-    ; check joypad interrupt on falling? simplified: if any pressed bit now 0, request
-    call read_p1
-    test al,0x0F
-    jnz .out
-    ; request joypad IRQ only if newly pressed: approximate always set when low nibble non-zero inverted
-    or byte [io+0x0F],0x10
+    ; P1 is a raw register; joypad IRQs are raised on a 1->0 line edge by
+    ; poll_input, where key state actually changes.
     jmp .out
 .lcdc_w:
     ; turning LCD off resets LY/mode
@@ -1373,7 +1534,9 @@ write_mem:
 
 ; request interrupt: rdi = bitmask (1=VBL,2=LCD,4=TIMER,8=SERIAL,16=JOY)
 request_irq:
-    or [io+0x0F],dil
+    mov al,dil
+    and al,0x1F
+    or [io+0x0F],al
     ret
 
 ; ---------- PPU / Timer stepping ----------
@@ -1566,19 +1729,21 @@ step_ppu:
 .statupd:
     mov al,[ppu_ly]
     mov [io+0x44],al
-    ; STAT bits 0-1 = mode, bit2 coincidence
-    mov al,[ppu_ly]
+    ; LYC coincidence compares LY, not the STAT register (which also
+    ; contains mode bits), and feeds both STAT bit 2 and source bit 6.
+    xor r8d,r8d
     cmp al,[io+0x45]
-    jne .nocoinced
-    or byte [io+0x41],0x04
-    jmp .coincdone
-.nocoinced:
-    and byte [io+0x41],~4
-.coincdone:
+    jne .noco
+    mov r8d,1
+.noco:
+    and byte [io+0x41],0xFB
+    mov al,r8b
+    shl al,2
+    or [io+0x41],al
     mov al,[ppu_mode]
     and byte [io+0x41],0xFC
     or [io+0x41],al
-    ; STAT interrupt: sources bit3(mode0),4(mode1),5(mode2),6(lyc)
+    ; STAT sources: bit3 mode0, bit4 mode1, bit5 mode2, bit6 LYC.
     xor edx,edx
     mov al,[io+0x41]
     test al,0x08
@@ -1598,8 +1763,8 @@ step_ppu:
     mov edx,1
 .s2: test al,0x40
     jz .s3
-    cmp al,[io+0x45]
-    jne .s3
+    test r8d,r8d
+    jz .s3
     mov edx,1
 .s3:
     cmp byte [stat_prev],0
@@ -1614,6 +1779,8 @@ step_ppu:
 .lcd_off:
     mov byte [ppu_mode],0
     and byte [io+0x41],0xFC
+    and byte [io+0x41],0xFB
+    mov byte [stat_prev],0
 .out:
     pop r14
     pop r13
@@ -1624,6 +1791,9 @@ step_ppu:
     ret
 
 ; ---------- render scanline: rdi = LY ----------
+; ---------- render scanline: rdi = LY ----------
+; BG/window and sprites are composited per pixel. Tile rows use the real
+; interleaved 2-byte format and the signed tile base is 0x9000 (vram+0x1000).
 render_scanline:
     push rbx
     push rcx
@@ -1635,42 +1805,45 @@ render_scanline:
     push r14
     push r15
     mov r12,rdi
+    lea rdi,[bg_line_idx]
+    xor eax,eax
+    mov ecx,160
+    rep stosb
     test byte [io+0x40],0x80
     jz .fill
     test byte [io+0x40],0x01
     jz .fill
-    mov r13,0
+    xor r13,r13
 .bgx:
     cmp r13,160
     jge .sprites
-    ; defaults: map coords in r15=mapx, r14=mapy, rbx=base
-    mov r14,0
+    xor r14,r14
+    xor r15,r15
+    mov ebx,0x1800
+    ; Window: enabled, LY>=WY, WX in 7..166, and X >= WX-7.
     test byte [io+0x40],0x20
-    jz .bg_coord
+    jz .bg_layer
     movzx rax,byte [io+0x4A]
     cmp r12,rax
-    jb .bg_coord
+    jb .bg_layer
     movzx rax,byte [io+0x4B]
+    cmp eax,7
+    jb .bg_layer
+    cmp eax,166
+    ja .bg_layer
+    sub eax,7
     cmp r13,rax
-    jb .bg_coord
-    ; window
-    movzx r15,byte [io+0x4B]
-    mov rax,r13
-    sub rax,r15
-    mov r15,rax
-    movzx rax,byte [io+0x4A]
-    mov rax,r12
+    jb .bg_layer
+    mov r15,r13
+    sub r15,rax
+    mov r14,r12
     movzx rcx,byte [io+0x4A]
-    sub rax,rcx
-    mov r14,rax
+    sub r14,rcx
     test byte [io+0x40],0x40
-    jz .wb0
-    mov rbx,0x1C00
+    jz .gettile
+    mov ebx,0x1C00
     jmp .gettile
-.wb0:
-    mov rbx,0x1800
-    jmp .gettile
-.bg_coord:
+.bg_layer:
     movzx rax,byte [io+0x43]
     add rax,r13
     mov r15,rax
@@ -1678,11 +1851,8 @@ render_scanline:
     add rax,r12
     mov r14,rax
     test byte [io+0x40],0x08
-    jz .bb0
-    mov rbx,0x1C00
-    jmp .gettile
-.bb0:
-    mov rbx,0x1800
+    jz .gettile
+    mov ebx,0x1C00
 .gettile:
     and r15,255
     and r14,255
@@ -1694,227 +1864,188 @@ render_scanline:
     add rax,rcx
     add rax,rbx
     lea rsi,[vram]
-    movzx rcx,byte [rsi+rax]
+    movzx ebx,byte [rsi+rax]
     test byte [io+0x40],0x10
     jnz .t_unsigned
-    movsx rcx,cl
-    lea rax,[vram+0x800]   ; 0x8800 tile data (vram base = 0x8000)
-    shl rcx,4
-    add rax,rcx
+    movsx rbx,bl
+    shl rbx,4
+    lea rax,[vram+0x1000]
+    add rax,rbx
     jmp .t_addr
 .t_unsigned:
-    shl rcx,4
+    shl rbx,4
     lea rax,[vram]
-    add rax,rcx
+    add rax,rbx
 .t_addr:
-    ; rax = tile data ptr, r14=mapy, r15=mapx, r13=x, r12=ly
     and r14,7
-    mov dl,[rax+r14]
-    mov r10b,[rax+r14+8]
+    lea rax,[rax+r14*2]
+    movzx edx,byte [rax]
+    movzx ebx,byte [rax+1]
     mov rcx,r15
-    and rcx,7
-    mov rsi,7
-    sub rsi,rcx
-    mov rcx,rsi
-    shr dl,cl
-    and dl,1
-    shr r10b,cl
-    and r10b,1
-    shl r10b,1
-    or dl,r10b
-    movzx rsi,byte [io+0x47]
-    movzx rcx,dl
-    shl rcx,1
-    shr rsi,cl
-    and esi,3
-    mov eax,esi
+    and ecx,7
+    mov esi,7
+    sub esi,ecx
+    mov ecx,esi
+    shr edx,cl
+    and edx,1
+    shr ebx,cl
+    and ebx,1
+    shl ebx,1
+    or edx,ebx
+    lea rsi,[bg_line_idx]
+    mov [rsi+r13],dl
+    movzx eax,byte [io+0x47]
+    mov ecx,edx
+    shl ecx,1
+    shr eax,cl
+    and eax,3
     call set_pixel_from_indextmp
     inc r13
     jmp .bgx
 .fill:
-    mov r13,0
+    xor r13,r13
 .fb:
     cmp r13,160
     jge .sprites
-    mov eax,0
+    mov byte [bg_line_idx+r13],0
+    xor eax,eax
     call set_pixel_from_indextmp
     inc r13
     jmp .fb
 .sprites:
     test byte [io+0x40],0x02
     jz .done
-    mov r14,39
+    lea rdi,[spr_line_col]
+    xor eax,eax
+    mov ecx,160
+    rep stosb
+    lea rdi,[spr_line_x]
+    mov al,0xFF
+    mov ecx,160
+    rep stosb
+    xor r14,r14
 .spr_loop:
-    cmp r14,0
-    jl .done
+    cmp r14,40
+    jge .composite
     mov rax,r14
     shl rax,2
     lea rsi,[oam]
-    movzx rcx,byte [rsi+rax]
-    movzx rdx,byte [rsi+rax+1]
-    movzx r15,byte [rsi+rax+2]
-    movzx rbx,byte [rsi+rax+3]
-    ; sy = y-16 in rdi, h in stack? use r8
-    mov rdi,rcx
-    sub rdi,16
+    movzx ecx,byte [rsi+rax]     ; OAM Y
+    movzx edx,byte [rsi+rax+1]   ; OAM X
+    movzx ebx,byte [rsi+rax+2]   ; tile
+    movzx r15d,byte [rsi+rax+3]  ; attributes
     mov r8,8
-    test byte [io+0x40],0x20
-    jz .h_ok
+    test byte [io+0x40],0x04     ; LCDC bit2: 8x16 sprites
+    jz .spr_h
     mov r8,16
-.h_ok:
+.spr_h:
+    sub ecx,16
     mov rax,r12
-    sub rax,rdi
+    sub rax,rcx
     cmp rax,0
-    jl .spr_next
+    jl .next_spr
     cmp rax,r8
-    jae .spr_next
-    ; rowFull
-    test bl,0x40
-    jz .row_norm
+    jae .next_spr
+    test r15b,0x40               ; Y flip
+    jz .spr_row
     mov rcx,r8
     dec rcx
     sub rcx,rax
     mov rax,rcx
-.row_norm:
-    ; rax = rowFull, adjust tile for 8x16
+.spr_row:
     cmp r8,16
-    jne .row8
-    and r15,~1
+    jne .spr_row8
+    and ebx,0xFE
     mov rcx,rax
     shr rcx,3
-    add r15,rcx
+    add ebx,ecx
+.spr_row8:
     and rax,7
-.row8:
-    shl r15,4
+    shl rbx,4
     lea rsi,[vram]
-    add rsi,r15
-    mov r10b,[rsi+rax]
-    mov r11b,[rsi+rax+8]
-    ; sx base in rdi (already), iterate i=r9 0..7, preserve idx r14, attr rbx, x rdx
+    add rsi,rbx
+    lea rsi,[rsi+rax*2]
+    movzx r10d,byte [rsi]
+    movzx r11d,byte [rsi+1]
+    sub edx,8
     xor r9,r9
 .spix:
     cmp r9,8
-    jge .spr_next_pop
-    mov rax,rdi
-    add rax,r9
-    cmp rax,0
+    jge .next_spr
+    lea rdi,[rdx+r9]
+    cmp rdi,0
     jl .spix_next
-    cmp rax,160
+    cmp rdi,160
     jge .spix_next
-    ; bitpos: flipX ? i : 7-i
-    mov rcx,r9
-    test bl,0x80
-    jz .bitpos_norm
-    ; flipx: bitpos = i
-    jmp .bitpos_ok
-.bitpos_norm:
-    mov rcx,7
-    sub rcx,r9
-.bitpos_ok:
-    movzx rsi,r10b
-    shr sil,cl
-    and sil,1
-    movzx rdx,r11b
-    shr dl,cl
-    and dl,1
-    shl dl,1
-    or sil,dl
-    test sil,sil
+    mov ecx,7
+    sub ecx,r9d
+    test r15b,0x20               ; X flip
+    jz .spr_bit
+    mov ecx,r9d
+.spr_bit:
+    mov eax,r10d
+    shr eax,cl
+    and eax,1
+    mov ebx,r11d
+    shr ebx,cl
+    and ebx,1
+    shl ebx,1
+    or eax,ebx
+    test eax,eax
     jz .spix_next
-    ; priority check
-    test bl,0x80
-    jz .draw_px
-    ; if bg pixel not color0-equivalent, skip: compare framebuf to palette[BGP&3]
-    push rax
-    push rcx
-    push rsi
-    push rdi
-    push r9
-    push r10
-    push r11
-    push r15
-    mov rax,r12
-    imul rax,160
-    add rax,rdi
-    add rax,r9
-    imul rax,3
-    lea rcx,[framebuf]
-    add rax,rcx
-    mov rsi,rax
-    movzx eax,byte [io+0x47]
-    and eax,3
-    lea rcx,[palette_rgb]
-    shl rax,2
-    add rax,rcx
-    mov dl,[rax]
-    cmp [rsi],dl
-    jne .prio_skip
-    mov dl,[rax+1]
-    cmp [rsi+1],dl
-    jne .prio_skip
-    mov dl,[rax+2]
-    cmp [rsi+2],dl
-    jne .prio_skip
-    pop r15
-    pop r11
-    pop r10
-    pop r9
-    pop rdi
-    pop rsi
-    pop rcx
-    pop rax
-    jmp .draw_px
-.prio_skip:
-    pop r15
-    pop r11
-    pop r10
-    pop r9
-    pop rdi
-    pop rsi
-    pop rcx
-    pop rax
-    jmp .spix_next
-.draw_px:
-    ; sil=color idx, bl=attr, r9=i, rdi=sxbase ; set pixel needs r13=sx, r12=ly, eax=mapped
-    push rdi
-    push r9
-    push r10
-    push r11
-    push r15
-    push rbx
-    push rcx
-    push rsi
-    test bl,0x10
-    jz .pal0
-    movzx rsi,byte [io+0x49]
-    jmp .palok
-.pal0:
-    movzx rsi,byte [io+0x48]
-.palok:
-    movzx rcx,sil
-    shl rcx,1
-    shr rsi,cl
-    and esi,3
-    mov rax,rdi
-    add rax,r9
-    mov r13,rax
-    mov eax,esi
-    call set_pixel_from_indextmp
-    pop rsi
-    pop rcx
-    pop rbx
-    pop r15
-    pop r11
-    pop r10
-    pop r9
-    pop rdi
+    lea rsi,[spr_line_col]
+    cmp byte [rsi+rdi],0
+    je .spr_take
+    lea rsi,[spr_line_x]
+    movzx ebx,byte [rsi+rdi]
+    cmp edx,ebx                  ; lower OAM X wins; ties keep lower index
+    jae .spix_next
+.spr_take:
+    lea rsi,[spr_line_col]
+    mov [rsi+rdi],al
+    lea rsi,[spr_line_attr]
+    mov [rsi+rdi],r15b
+    lea rsi,[spr_line_x]
+    mov [rsi+rdi],dl
 .spix_next:
     inc r9
     jmp .spix
-.spr_next_pop:
-.spr_next:
-    dec r14
+.next_spr:
+    inc r14
     jmp .spr_loop
+.composite:
+    xor r13,r13
+.comp:
+    cmp r13,160
+    jge .done
+    lea rsi,[spr_line_col]
+    movzx edx,byte [rsi+r13]
+    test edx,edx
+    jz .comp_next
+    lea rsi,[spr_line_attr]
+    movzx eax,byte [rsi+r13]
+    test al,0x80                 ; OAM priority bit: hide on BG color != 0
+    jz .comp_draw
+    lea rsi,[bg_line_idx]
+    cmp byte [rsi+r13],0
+    jne .comp_next
+.comp_draw:
+    test al,0x10
+    jz .comp_pal0
+    movzx esi,byte [io+0x49]
+    jmp .comp_pal
+.comp_pal0:
+    movzx esi,byte [io+0x48]
+.comp_pal:
+    mov ecx,edx
+    shl ecx,1
+    shr esi,cl
+    and esi,3
+    mov eax,esi
+    call set_pixel_from_indextmp
+.comp_next:
+    inc r13
+    jmp .comp
 .done:
     pop r15
     pop r14
@@ -1926,6 +2057,7 @@ render_scanline:
     pop rcx
     pop rbx
     ret
+
 ; set pixel: r13=x, r12=ly, eax=color index 0-3 (BGP already applied for BG; for generic use eax directly)
 set_pixel_from_indextmp:
     push rbx
@@ -2418,20 +2550,14 @@ cond_true:
 
 ; ---------- interrupts ----------
 service_interrupt: ; rdi = irq bit (1,2,4,8,16)
-    push rdi
-    push rsi
-    push rax
-    and byte [io+0x0F],~1
-    ; actually clear only the serviced bit: recompute
-    pop rax
-    pop rsi
-    pop rdi
-    ; clear bit in IF
+    ; Clear only the bit being serviced. Never touch the other pending flags
+    ; (the previous VBlank-clear on every vector lost interrupts).
     push rdi
     mov al,[io+0x0F]
     mov rcx,rdi
     not cl
     and al,cl
+    and al,0x1F
     mov [io+0x0F],al
     pop rdi
     mov byte [ime],0
@@ -3071,7 +3197,7 @@ op_reti:
     mov byte [ime],1
     call pop16
     mov [gb_pc],ax
-    mov dword [instr_cycles],4
+    mov dword [instr_cycles],16
     jmp cpu_finish_step
 ; generic helpers decoding from r12d
 ; op_inc_r / op_dec_r / op_ld_r_d8 : target = (op>>3)&7
@@ -3398,7 +3524,8 @@ op_ld_a16_sp: ; (a16),SP 0x08  writes lo at a16, hi at a16+1
 op_jr:
     call fetch8
     movsx rax,al
-    add rax,[gb_pc]
+    movzx rcx,word [gb_pc]
+    add rax,rcx
     mov [gb_pc],ax
     mov dword [instr_cycles],12
     jmp cpu_finish_step
@@ -3826,10 +3953,11 @@ op_daa_sub:
     jmp cpu_finish_step
 op_cpl:
     xor byte [gb_a],0xFF
+    ; N and H set; Z and C are preserved (CPL does not touch them).
     mov al,[gb_f]
     and al,0x90
-    mov byte [gb_f],0x60
-    or [gb_f],al
+    or al,0x60
+    mov [gb_f],al
     mov dword [instr_cycles],4
     jmp cpu_finish_step
 op_scf:
@@ -4015,10 +4143,14 @@ cb_execute:
     call set_r
 .nostore:
     ; decide cycles BEFORE popping r13 (pops restore caller's r13)
+    ; BIT n,(HL) is 12 T-cycles; CB modifies/rotates (HL) are 16.
     mov eax,8
     cmp r13d,6
     jne .cb_cyc_ok
     mov eax,16
+    cmp r14d,1
+    jne .cb_cyc_ok
+    mov eax,12
 .cb_cyc_ok:
     pop r14
     pop r13
@@ -4144,9 +4276,6 @@ run_emulator:
     mov rax,SYS_nanosleep
     syscall
 .after_display:
-    cmp byte [audio_enabled],0
-    je .check_quit
-    call audio_gen_frame
 .check_quit:
     cmp byte [quit_flag_bss],0
     jne .finished
@@ -4167,6 +4296,11 @@ timespec_16ms: dq 0, 8000000
 ; ---------- poll keyboard (nonblocking read) ----------
 ; keys are momentary: cleared each frame, set from bytes read this frame
 poll_input:
+    ; Snapshot the selected P1 input lines before changing key state, so a
+    ; key press can raise the joypad IRQ on its 1->0 edge.
+    call read_p1
+    and al,0x0F
+    mov [p1_old],al
     mov byte [key_up],0
     mov byte [key_down],0
     mov byte [key_left],0
@@ -4176,7 +4310,7 @@ poll_input:
     mov byte [key_start],0
     mov byte [key_select],0
     cmp byte [stdin_nonblock],0
-    je .d
+    je .edge
     push rbx
     push rcx
     push rdi
@@ -4270,6 +4404,15 @@ poll_input:
     pop rdi
     pop rcx
     pop rbx
+.edge:
+    call read_p1
+    and al,0x0F
+    mov dl,[p1_old]
+    not al
+    and dl,al
+    jz .d
+    mov rdi,16
+    call request_irq
 .d: ret
 
 ; ---------- display frame to terminal (half-block, RLE per row pair) ----------
@@ -4706,6 +4849,11 @@ apu_io_read:
     je .nr52
     cmp rdi,0x30
     jae .wave
+    cmp rdi,0x27
+    jb .normal
+    mov eax,0xFF
+    jmp .out
+.normal:
     movzx eax,byte [rbx+rdi]
     lea rcx,[apu_rdmask]
     movzx edx,byte [rcx+rdi-0x10]
@@ -4805,6 +4953,12 @@ apu_io_write:
     mov [apu_len+r12*2],cx
     jmp .done
 .powered:
+    ; 0x27-0x2F are unmapped; do not run them through the channel index math.
+    cmp r13,0x27
+    jb .apu_map
+    cmp r13,0x30
+    jb .done
+.apu_map:
     mov rax,r13
     sub rax,0x10
     xor edx,edx
@@ -5188,7 +5342,6 @@ apu_reload_timer:
 .nz:
     shl edx,4
 .nz2:
-    shl edx,4
     shl edx,cl
     mov [rbx+rax],edx
 .done:
@@ -5397,36 +5550,36 @@ apu_step:
     sub eax,r14d
     cmp eax,0
     jg .tim_store
-    ; timer expired: advance position, reload period
     cmp r12d,2
     je .tim_wave
     cmp r12d,3
     je .tim_noise
+.tim_sq_exp:
     inc byte [apu_dutypos+r12]
     and byte [apu_dutypos+r12],7
-    jmp .tim_reload
+    call apu_reload_timer
+    mov edx,[apu_timer+r12*4]
+    add eax,edx
+    cmp eax,0
+    jle .tim_sq_exp
+    mov [apu_timer+r12*4],eax
+    jmp .tim_next
 .tim_wave:
-    ; one nibble per (2048-freq)*2 cycles; loop over every expiry in the
-    ; chunk and flag a fetch only when the chunk ends exactly on one
     cmp byte [apu_active+2],0
     je .tim_wave_off
     cmp byte [apu_dac+2],0
     je .tim_wave_off
-    movzx ecx,word [apu_freq+4]
-    mov edi,2048
-    sub edi,ecx
-    shl edi,1
-    test edi,edi
-    jnz .tim_wave_period
-    mov edi,1
-.tim_wave_period:
-.tim_wave_loop:
-    add eax,edi
+.tim_wave_exp:
     inc byte [apu_dutypos+2]
     and byte [apu_dutypos+2],31
+    call apu_reload_timer
+    mov edx,[apu_timer+r12*4]
+    add eax,edx
     cmp eax,0
-    jle .tim_wave_loop
-    cmp eax,edi
+    jle .tim_wave_exp
+    ; DMG exposes a wave byte only when the access lands exactly on a
+    ; fetch boundary; preserve that edge condition from the cycle model.
+    cmp eax,edx
     jne .tim_wave_store
     mov byte [apu_wave_flag],1
 .tim_wave_store:
@@ -5436,21 +5589,27 @@ apu_step:
     mov dword [apu_timer+r12*4],0
     jmp .tim_next
 .tim_noise:
-    movzx eax,word [apu_lfsr]
-    mov edx,eax
+.tim_noise_exp:
+    movzx ecx,word [apu_lfsr]
+    mov edx,ecx
     and edx,1
-    shr eax,1
-    xor eax,edx
-    movzx edx,byte [io+0x22]
-    test dl,0x08
-    jz .nshort
-    or eax,0x4000
-.nshort:
-    and eax,0x7FFF
-    mov [apu_lfsr],ax
-.tim_reload:
+    shr ecx,1
+    xor ecx,edx
+    test byte [io+0x22],0x08
+    jz .noise_15
+    and ecx,0x7F
+    jmp .noise_store
+.noise_15:
+    and ecx,0x7FFF
+.noise_store:
+    mov [apu_lfsr],cx
     call apu_reload_timer
-    mov eax,[apu_timer+r12*4]
+    mov edx,[apu_timer+r12*4]
+    add eax,edx
+    cmp eax,0
+    jle .tim_noise_exp
+    mov [apu_timer+r12*4],eax
+    jmp .tim_next
 .tim_store:
     mov [apu_timer+r12*4],eax
 .tim_next:
@@ -5462,7 +5621,7 @@ apu_step:
     add [apu_fs_cyc],r14d
 .fs_loop:
     cmp dword [apu_fs_cyc],8192
-    jb .done
+    jb .audio_tick
     sub dword [apu_fs_cyc],8192
     mov al,[apu_fs_step]
     cmp al,7
@@ -5490,9 +5649,22 @@ apu_step:
     jmp .fs_loop
 .off_done:
     ; while NR52 bit 7 is clear the frame sequencer neither steps nor
-    ; clocks anything; the phase is restarted by the power-on write
-    jmp .done
-.done:
+    ; clocks anything; the phase is restarted by the power-on write.
+    ; Audio sampling still runs so silence keeps the timeline continuous.
+    jmp .audio_tick
+.audio_tick:
+    cmp byte [audio_enabled],0
+    je .epilogue
+    mov rax,r14
+    imul rax,44100
+    add [audio_accum],rax
+.audio_loop:
+    cmp qword [audio_accum],4194304
+    jb .epilogue
+    sub qword [audio_accum],4194304
+    call audio_emit_sample
+    jmp .audio_loop
+.epilogue:
     pop r15
     pop r14
     pop r13
@@ -5504,7 +5676,11 @@ apu_step:
     pop rbx
     ret
 
-audio_gen_frame:
+; audio_emit_sample: mix the current APU channel state into one 16-bit
+; sample. Called from apu_step every time the 4.194304 MHz -> 44.1 kHz
+; accumulator crosses a sample boundary, so channel progression is tracked
+; per emulated cycle rather than once per video frame.
+audio_emit_sample:
     push rbx
     push rcx
     push rdx
@@ -5514,10 +5690,6 @@ audio_gen_frame:
     push r13
     push r14
     push r15
-    mov r12,0
-.gen:
-    cmp r12,738
-    jge .flush
     xor r14d,r14d
     xor r13d,r13d
 .sq:
@@ -5577,8 +5749,9 @@ audio_gen_frame:
 .w_half:
     sar ecx,1
 .w_full:
+    ; centre the 4-bit nibble (0..15) around zero
     shl ecx,6
-    sub ecx,512
+    sub ecx,480
     add r14d,ecx
 .noisech:
     cmp byte [apu_active+3],0
@@ -5606,13 +5779,9 @@ audio_gen_frame:
     mov [rbx],r14w
     add qword [audio_buf_len],2
     cmp qword [audio_buf_len],16000
-    jb .no_flush
+    jb .done
     call audio_flush
-.no_flush:
-    inc r12
-    jmp .gen
-.flush:
-    call audio_flush
+.done:
     pop r15
     pop r14
     pop r13
@@ -5623,6 +5792,7 @@ audio_gen_frame:
     pop rcx
     pop rbx
     ret
+
 audio_flush:
     push rbx
     push rdi
@@ -5630,11 +5800,49 @@ audio_flush:
     push rdx
     cmp qword [audio_buf_len],0
     je .d
+    cmp qword [audio_fd],0
+    jl .clear
+    mov rbx,[audio_buf_len]
     mov rdi,[audio_fd]
     lea rsi,[audio_buf]
-    mov rdx,[audio_buf_len]
+    mov rdx,rbx
     call write_all
+    add [audio_bytes],rbx
+.clear:
     mov qword [audio_buf_len],0
+.d: pop rdx
+    pop rsi
+    pop rdi
+    pop rbx
+    ret
+
+; audio_finalize: flush PCM, patch the RIFF and data chunk sizes, close.
+audio_finalize:
+    push rbx
+    push rdi
+    push rsi
+    push rdx
+    cmp byte [audio_enabled],0
+    je .d
+    call audio_flush
+    cmp qword [audio_fd],0
+    jl .d
+    mov eax,[audio_bytes]
+    lea ecx,[eax+36]
+    mov [wav_header+4],ecx
+    mov [wav_header+40],eax
+    mov rax,SYS_lseek
+    mov rdi,[audio_fd]
+    xor rsi,rsi
+    xor rdx,rdx
+    syscall
+    mov rdi,[audio_fd]
+    lea rsi,[wav_header]
+    mov rdx,44
+    call write_all
+    mov rax,SYS_close
+    mov rdi,[audio_fd]
+    syscall
 .d: pop rdx
     pop rsi
     pop rdi

@@ -1,251 +1,147 @@
-# Game Boy Emulator — Entirely in Assembly Language
+# Game Boy (DMG) Emulator in x86-64 Assembly
 
-A complete Nintendo Game Boy (DMG) emulator written **100% in x86-64 assembly
-language** (NASM syntax, assembled with NASM + `ld`). No C, no C++, no libc,
-no dynamic libraries, no interpreted code — every instruction is a Linux
-syscall issued directly from hand-written assembly.
+A Nintendo Game Boy emulator written in **100% x86-64 assembly** (NASM + `ld`).
+The emulator contains no C, no libc, and no interpreted code; every runtime
+operation goes through Linux syscalls issued from hand-written assembly.
+
+`frame_preview.png` is the deterministic frame produced by `tests/hello.gb`
+(240 frames, SHA-256 `6d6829cc88b0856f2f15addcf9879ea591ac26f16795347209cccc6e30050b82`).
 
 ## Build
 
-```sh
-# requires: nasm (https://www.nasm.us), ld (binutils), make
-make            # builds ./gameboy
-make test       # builds tests/hello.gb and runs it headless, dumping a frame
-```
+Requires NASM, binutils (`ld`), make, and for the test target bash plus
+`ffmpeg`/`ffprobe`.
 
-On systems without NASM: download a NASM release tarball and build it from
-source (`./autogen.sh` may be skipped with a downloaded release; `make nasm`),
-then `PATH=$PWD/nasm-*/:$PATH make`.
+```sh
+make            # builds ./gameboy
+make test       # builds ROMs and runs deterministic assertions
+make clean
+```
 
 ## Usage
 
 ```sh
-./gameboy [--headless] [--frames N] [--dump FILE.ppm] [--serial] [--audio FILE.wav] [--debug] [--exit-on-result] ROM.gb
+./gameboy [--headless] [--frames N] [--dump FILE.ppm] [--serial]
+          [--audio FILE.wav] [--debug] [--exit-on-result] [--verdict] ROM.gb
 ```
 
-* **Terminal mode (default):** renders the 160×144 screen as ANSI true-color
-  half-block characters (U+2580) and reads the keyboard in raw mode.
-  Keys: **Arrows / WASD** = D-pad, **Z** = B, **X** = A, **Enter** = Start,
-  **Space** = Select, **Esc / Q** = quit.
-* `--frames N` — run exactly N frames (implies useful for CI) and exit.
-* `--dump FILE.ppm` — write the final frame as a binary PPM image.
-* `--serial` — write bytes the game sends to the serial port (SB/SC) to
-  stdout. This lets test ROMs (e.g. CPU test suites) print results.
-* `--audio FILE.wav` — write 44.1 kHz mono 16-bit WAV audio.
-* `--debug` — trace PC:opcode for the first 200 instructions to stdout.
-* `--exit-on-result` — stop as soon as the cartridge writes a final result
-  byte (the `$A000` verdict leaves `$80`), save `ROM.gb.sav`, and print the
-  number of frames executed as a little-endian 64-bit value on stderr.
+* **Terminal mode:** 160×144 screen as ANSI true-colour half blocks. Keys:
+  Arrows/WASD = D-pad, Z = B, X = A, Enter = Start, Space = Select,
+  Esc/Q = quit.
+* `--headless` — no terminal rendering.
+* `--frames N` — run exactly N frames and exit (CI-friendly).
+* `--dump FILE.ppm` — write the final frame as a binary PPM.
+* `--serial` — write SB bytes to stdout when a serial transfer starts.
+* `--audio FILE.wav` — write 44.1 kHz mono 16-bit PCM WAV.
+* `--debug` — trace the first 200 PC:opcode pairs.
+* `--exit-on-result` — stop when the cartridge writes the Blargg
+  `$A000` signature (`DE B0 61`) and a final status, save `ROM.gb.sav`,
+  and print the executed frame count as 8 little-endian bytes on stderr.
+* `--verdict` — print `VERDICT xx` (the `$A000` status byte) at exit.
+  Used by the `dmg_sound` test driver.
 
-Cartridge RAM (MBC1/3/5) is saved next to the ROM as `ROM.gb.sav` and
-re-loaded on the next run.
+Cartridge RAM is saved as `ROM.gb.sav` (MBC1/3/5, when the header declares
+RAM) and loaded at startup. Paths longer than 500 bytes and ROM images outside
+32 KiB–8 MiB are rejected before any cartridge access.
 
-## What's implemented
+## Implemented
 
-* **CPU:** full LR35902 — all primary and CB-prefixed opcodes, flags
-  (Z/N/H/C), `ADD SP,e8` / `LD HL,SP+e8` half-carry rules, `DAA`, rotates
-  through carry, `BIT/RES/SET`, `PUSH/POP`, `CALL/RET/RST`, `EI` with the
-  one-instruction delay, `DI`, `RETI`, and `HALT` wake-up with IME=0/1.
-  The boot ROM is skipped: registers start in the documented post-boot
-  state (PC=0100, SP=FFFE, AF=01B0, BC=0013, DE=00F8, HL=014D, I/O values
-  as left by the boot ROM), so real cartridges boot immediately.
-* **PPU:** modes 0–3 with correct dot timing (456 dots/line, 154 lines),
-  STAT + LYC coincidence interrupts, LY/LYC, BG with scroll (SCX/SCY),
-  both tile-data addressing modes (8000 unsigned / 8800 signed) and both
-  tile-map bases (9800/9C00), window layer (WX/WY), sprites (OAM,
-  8×8/8×16, flip X/Y, priority, OBP0/OBP1), BGP/OBP palettes, OAM DMA
-  (FF46), and the DMG 4-shade palette.
-* **Timers:** DIV (FF04, write resets), TIMA/TMA/TAC with falling-edge
-  detection on the selected divider bit and overflow interrupt.
-* **Interrupts:** VBlank, LCD STAT, Timer, Serial, Joypad with correct
-  priority and vector addresses (40/48/50/58/60).
-* **Joypad:** P1 (FF00) button/D-pad group selection; key presses raise
-  the joypad interrupt. Keyboard input is momentary (visible for one
-  frame per key byte); in headless mode keys may also be supplied on
-  stdin.
-* **Serial:** SB/SC (FF01/FF02) — writes SB to stdout when a transfer starts.
-* **APU:** a real 512 Hz frame sequencer (8192 T-cycles per step) clocks
-  the four channels: length counters at 256 Hz, sweep at 128 Hz and the
-  volume envelope at 64 Hz. Implemented: per-channel length counters with
-  reload (0 -> max), freeze/unfreeze, the DMG extra-length-clock quirk,
-  DAC gating and trigger effects; sweep with shadow frequency, period-0
-  treated as 8, negate-mode flag/quirk and overflow disable; NR52 power
-  on/off (registers 0x10-0x25 cleared on power-off, reads masked while
-  off, wave RAM preserved, length counters not clocked while off);
-  per-register read masks (write-only bits read as 1s); wave-RAM access
-  gating while channel 3 plays; duty/wave/noise sample timers. The four
-  channels mix to mono 16-bit WAV.
-* **Cartridge controllers:** ROM-only, MBC1 (ROM/RAM banking + mode),
-  MBC3 (ROM/RAM banking; RTC registers accepted), MBC5, external RAM
-  banking, echo RAM (E000–FDFF), HRAM, and .sav persistence.
+* **CPU:** LR35902 primary and CB opcodes, flags, `DAA`, rotates, `BIT/RES/SET`,
+  `PUSH/POP`, `CALL/RET/RST`, `EI` delay, `DI`, `RETI`, `HALT` wake-up,
+  `ADD SP,e8` / `LD HL,SP+e8` half-carry rules. The boot ROM is skipped and
+  the documented post-boot register state is installed.
+* **PPU:** modes 0–3 with 456 dots/line and 154 lines, STAT mode and LYC
+  coincidence interrupts, LY/LYC, BG and window layers, SCX/SCY, both tile-map
+  bases, both tile-data addressing modes (0x8000 unsigned and 0x9000 signed),
+  interleaved 2-byte tile rows, WX-7 window origin, OAM sprites (8×8/8×16,
+  X/Y flips, OBP0/OBP1, BG priority and lower-X priority), OAM DMA, and the
+  DMG four-shade palette. Rendering happens once per scanline at mode-3 entry.
+* **APU:** 512 Hz frame sequencer, four channels, length counters, sweep,
+  envelope, wave RAM and DMG wave read/write gating, NR52 power semantics,
+  per-register read masks, mono 16-bit WAV. Channel timers advance per
+  emulated T-cycle and a 4,194,304:44,100 accumulator emits samples at the
+  correct average rate; samples are byte-identical across runs.
+* **Cartridges:** ROM-only, MBC1 (ROM/RAM banking, mode 0/1), MBC3 (ROM/RAM
+  banking; RTC registers are accepted but stubbed), MBC5 (9-bit ROM bank,
+  4-bit RAM bank), RAM enable, RAM bank bounds, ROM-bank aliasing by real ROM
+  size, and `.sav` persistence.
+* **Other:** DIV/TIMA/TMA/TAC timer with falling-edge detection, VBlank/STAT/
+  Timer/Serial/Joypad interrupts with individual IF clearing, P1 selection and
+  A/B/Select/Start + D-pad mapping, serial SB/SC, echo RAM, HRAM, and OAM DMA.
 
-## Tests
+## Deterministic tests
 
-* `tests/hello.asm` — a Game Boy assembly test cartridge (checkerboard BG,
-  scrolling tile map, one DMA sprite, serial `OK` print). Build it with
-  `nasm -f bin tests/hello.asm` and run:
-  `./gameboy --headless --frames 240 --serial --dump frame.ppm tests/hello.gb`
-  Expected: serial prints `OK`, and the dumped frame contains exactly the
-  four DMG palette colours with the checker pattern and sprite visible.
-  Frame hash (240 frames, this build):
-  `42d4f7d8150df80bd806ae838828130b7a060ac1802431b43be5d4e09415b4ea`.
-* CPU flag behaviour was verified against a 25-case serial test ROM
-  (ADD/ADC/SUB/SBC, AND/XOR/OR/CP, INC, ADD HL, RLCA/RRCA/RLA, SLA, SWAP,
-  BIT, DAA, PUSH/POP, CALL, (HL±), ADD SP / LD HL,SP+e8) — all cases pass.
-* **Blargg `cpu_instrs` singles — all 11 report `Passed`**
-  (`./gameboy --headless --frames 60000 --serial ROM.gb`). ROMs are from
-  the public archive.org Blargg test-ROM set (repo does not contain ROMs):
+`make test` builds ten NASM-authored Game Boy test cartridges and asserts every
+result. It exits non-zero on any failed check:
 
-  | ROM | SHA-256 (first 16) | Result |
-  | --- | --- | --- |
-  | 01-special.gb | fe61349cbaee10cc | Passed |
-  | 02-interrupts.gb | fb90b0d2b9501910 | Passed |
-  | 03-op sp,hl.gb | ca553e606d9b9c86 | Passed |
-  | 04-op r,imm.gb | 7686aa7a39ef3d25 | Passed |
-  | 05-op rp.gb | d504adfa0a4c4793 | Passed |
-  | 06-ld r,r.gb | 17ada54b0b9c1a33 | Passed |
-  | 07-jr,jp,call,ret,rst.gb | ab31d3daaaa3a98b | Passed |
-  | 08-misc instrs.gb | 974a71fe4c67f70f | Passed |
-  | 09-op r,r.gb | b28e1be5cd95f22b | Passed |
-  | 10-bit ops.gb | 7f5b8e488c6988b5 | Passed |
-  | 11-op a,(hl).gb | 0ec0cf9fda3f00be | Passed |
+* CPU flag/instruction self-test (`CPU OK`, no `FAIL`).
+* MBC1, MBC3 and MBC5 ROM/RAM banking, RAM enable, bank bounds and aliasing.
+* MBC1 `.sav` contents in two RAM banks and a two-run save/load round trip.
+* Joypad P1 mapping for A, B, Select, Start and all four D-pad directions.
+* Timer interrupt flag preservation and STAT/LYC interrupts.
+* PPU golden frame hash `e6f79d132215aa8978a2b12573db4cd5c67d335d1e0b7ec9a10bbfa817977d6d`,
+  determinism, and a WX=15 window-origin pixel assertion.
+* Hello cartridge serial `OK` and golden frame hash
+  `6d6829cc88b0856f2f15addcf9879ea591ac26f16795347209cccc6e30050b82`.
+* WAV via `ffprobe`: `pcm_s16le`, 44100 Hz, mono, 16-bit, 1.004558 s for
+  60 frames, RIFF/data sizes equal the file, deterministic bytes, and
+  884 zero crossings in 1.004558 s (≈440 Hz).
+* Rejection of missing ROMs, ROMs below 32 KiB, and over-long paths.
 
-  Multicart `cpu_instrs.gb` (`8c5e12f41e0ba5bb…56fcf2`) runs the whole
-  suite as **256 subtests per pass and then repeats**. Runs were
-  verified pass-by-pass from the serial log:
-  * a 12M-frame run logged **240 complete passes** (61,524 `ok`
-    results, **0 failures**), every pass identical;
-  * a fresh 300k-frame run from the committed tree logged **10
-    complete passes** (2,670 `ok`, 0 failures), pass 1 byte-identical
-    to pass 2.
+The PPU test ROM specifically covers signed 0x9000 tile data, a negative tile
+index (0x80 → 0x8800), interleaved tile rows, a WX=15 window, SCX/SCY,
+8×8 sprite X/Y placement, X/Y flips, and both BG-priority and lower-X sprite
+priority.
 
-  So one full suite pass covers all 256 subtests, and the ROM keeps
-  looping it; the emulator reproduces that indefinitely with no
-  failures.
-* **Blargg `mem_timing` — all 3 singles and the multicart report
-  `Passed`** (read/write/modify memory-access cycle timing, verified
-  via the cartridge-RAM verdict at $A000, status 0). ROMs are from the
-  same public archive.org set:
+## Blargg results
 
-  | ROM | SHA-256 (first 16) | Result |
-  | --- | --- | --- |
-  | 01-read_timing.gb | d9c6e86b7008fdae | Passed |
-  | 02-write_timing.gb | 9188e5d9cf9dfc9e | Passed |
-  | 03-modify_timing.gb | 818256ab477bb8fb | Passed |
-  | mem_timing.gb (multicart) | ab9daf4c51f417c4 | 01:ok 02:ok 03:ok Passed |
-* **Input:** in headless mode the emulator also reads key bytes from
-  stdin (`w`=Up, `s`=Down, `a`=Left, `d`=Right, `z`=B, `x`=A,
-  `Enter`=Start, `Space`=Select; keys are momentary per frame). Verified
-  with a P1-reading test cartridge: no input → prints `N`; piped `x`
-  (A button) → prints `Y` (549× in 600 frames); piped `z` (B) → prints
-  `Y` on a B-button variant of the same cartridge (549×), and `x` on
-  that variant still prints `N`. Real frames of `mem_timing` and
-  `cpu_instrs` render their test screens in the four DMG colours.
+These are measured results, not claims. ROMs are fetched from the public
+`retrio/gb-test-roms` archive (not committed):
 
-## dmg_sound (APU) results
+```sh
+make fetch-blargg
+make test-blargg
+```
 
-Each single ROM was run headless with `--exit-on-result`, so every run
-stopped at the ROM's own `$A000` verdict instead of at a fixed frame
-count. **12 of 12 pass:**
+Run on 2026-11-09 against this tree:
 
-| ROM | status | result |
-| --- | --- | --- |
-| 01-registers | 0 | `Passed` |
-| 02-len ctr | 0 | `Passed` |
-| 03-trigger | 0 | `Passed` |
-| 04-sweep | 0 | `Passed` |
-| 05-sweep details | 0 | `Passed` |
-| 06-overflow on trigger | 0 | `Passed` (`0555 0666 071C 0787 07C1 07E0 07F0 0556 0667 071D 0788 07C2 07E1 07F1`) |
-| 07-len sweep period sync | 0 | `Passed` |
-| 08-len ctr during power | 0 | `Passed`; counter dump `33 44 11 22` (the ROM's own print order) |
-| 09-wave read while on | 0 | `Passed` |
-| 10-wave trigger while on | 0 | `Passed` |
-| 11-regs after power | 0 | `Passed`, including #4 |
-| 12-wave write while on | 0 | `Passed` |
+| Suite | Result |
+| --- | --- |
+| `cpu_instrs` singles (11) | **11/11 Passed** |
+| `mem_timing` singles (3) | **3/3 Passed** |
+| `mem_timing-2` singles (3) | **3/3 Passed** |
+| `dmg_sound` singles (12) | **12/12 Passed** (VERDICT 00) |
+| `instr_timing` (1) | **1/1 Passed** |
+| `oam_bug` singles (8) | **2/8 Passed** — OAM-bug behaviour is not emulated |
+| `interrupt_time` | **no result**: produced neither serial output nor an `$A000` verdict |
+| multicarts / `cgb_sound` | not part of the automated run; CGB mode is not implemented |
 
-Exit frames, in table order: 50, 565, 1009, 74, 71, 55, 35, 82, 36, 234,
-43, 234. They are identical to the counts measured before the MBC1
-cartridge-type fix described below, so sweep and frame-sequencer timing
-did not move.
+The automated Blargg job covers 30 singles (cpu_instrs, mem_timing,
+mem_timing-2, dmg_sound, instr_timing) and requires every one to report
+`Passed`/`VERDICT 00`. The `oam_bug` failures and the unsupported CGB suite are
+reported here rather than counted as passes.
 
-The five length/trigger/power ROMs (02, 03, 07, 08, 11) were failing on
-one bus bug rather than on five separate behaviours. `apu_active` stores
-one byte per channel, but the NR52 read loaded it as a dword and masked
-the low nibble, so only channel 1's active flag could ever reach the CPU:
-every `lda NR52 / and mask` poll for channels 2-4 read zero. Folding each
-byte into its own bit fixed all five at once, and 08's own dump
-`33 44 11 22` now matches its DMG reference CRC, so the ROM prints
-`Passed` with status 0.
+## CI
 
-The power-off/on semantics are implemented and measured separately: while
-NR52 bit 7 is clear the frame sequencer neither steps nor clocks anything,
-and the power-on write restarts step and phase together so no backlog is
-replayed. A register-preserving trace shows the four counters holding
-`11 22 44 33` (with all enable bits clear, power 0, step 0) across the
-power-down and zero length clocks while off, and 11 #4 passes because the
-off-state NR41 load survives the power cycle.
+`.github/workflows/ci.yml` has two Ubuntu 24.04 jobs:
 
-The sweep unit follows one model, reconciled from the test sources. The
-enable flag is latched at trigger (enabled when period or shift is
-non-zero) and NR10 writes do not change it, which is what 04's subtests
-8/9/10 assert: "trigger enables" when either field is non-zero, "trigger
-disables" when both are zero. While enabled, a calculation runs
-
-* on trigger when shift is non-zero,
-* on an NR10 write when period and shift are both non-zero, restarting
-  from the frequency registers rather than the already-swept shadow
-  (04 #9 needs `$03FF -> $05FE`, not `$05FE -> $8FD`),
-* when the sweep timer expires with a non-zero period.
-
-Calculations move only the private shadow; NR13/NR14 are written from it
-when the timer reloads with a non-zero period (05's test 09 wording),
-which makes 05 #7/#8 copy `$555`/`$556` instead of the swept `$500`/`$501`.
-A result above `$7FF`, or a negate->pos switch after a negate
-calculation, disables the channel. The clock itself is unchanged and
-DIV-aligned: ticks at frame-sequencer steps 2 and 6, four steps = 32768
-cycles = 128 Hz apart. All twelve singles now print `Passed` with status
-0 and signature `DE B0 61`.
-
-The multicart `dmg_sound.gb` now reports its own final verdict: status
-`00`, signature `DE B0 61`, and the console text `dmg_sound` /
-`01:ok 02:ok ... 12:ok` / `Passed` after **2133 frames** (~1.2 s of
-emulated time).
-
-`$80` is not a failure status and does not mean a test is still running in
-the sense of "not yet reached": the console setup (`init_text_out`) writes
-the `DE B0 61` signature and then `$80`, and only the exit path
-(`post_exit`, reached at `$2bcd`) writes the final byte. The earlier
-80000-frame run was in fact stuck in the multicart's slot scan, which
-exposed two MBC1 bugs:
-
-* The emulator only enabled MBC1 banking for cartridge types `$11`/`$12`
-  (which are actually MBC3). The real MBC1 IDs `$01`/`$02`/`$03` were
-  ignored, so every `$2000` ROM-bank write was dropped. Every Blargg cart
-  here is type `$03`, so the driver's scan read bank 1's `$C3` test entry
-  for every counter value and never reached the terminal slot that returns
-  from the driver.
-* Banked reads did not alias out-of-range banks by ROM size. The terminal
-  step is bank 4 in a 4-bank cart; hardware wraps that to bank 0 (the MBC1
-  zero-to-one substitution looks at the 5-bit register value, and 4 is
-  non-zero), where the slot byte is `$00`.
-
-Routing types `$01`-`$03` to MBC1 and masking banked reads with
-`rom_banks-1` after the zero-to-one substitution fixed both. The
-aggregate needs no joypad input (bank 0 contains no P1 reads) and no
-serial handshake; the twelve singles keep the same verdicts and exit
-frames after both fixes.
+1. `deterministic` — installs NASM/binutils/ffmpeg, runs `make`, then
+   `make test`.
+2. `blargg` — builds, downloads the public Blargg ROMs, and runs
+   `make test-blargg`.
 
 ## Known limitations
 
-* APU: frame sequencer, length/envelope/sweep clocks, DAC gating, NR52
-  power semantics, wave-RAM read/write gating and the DMG trigger
-  corruption are implemented and measured (12/12 `dmg_sound` singles
-  pass, including both sweep ROMs, all four wave ROMs, both
-  length-counter/power ROMs and the trigger ROM, and the `dmg_sound`
-  multicart prints `Passed` with status 0 at 2133 frames). No stereo
-  panning in the WAV output.
-* MBC1 in mode-1 high-bit ROM banking, and MBC3 RTC, are stubs.
-* A cartridge with CGB double-speed mode, or the `STOP` instruction, will
-  run at DMG speed only (STOP is treated as a short pause).
-* The terminal renderer is RLE-compressed but bandwidth-heavy on busy
-  screens; use `--dump` for screenshots or `--headless` for batch runs.
+* MBC3 RTC is a stub (register select is accepted; no clock data). MBC2,
+  MBC6, MBC7, HuC1/HuC3 and camera controllers are not implemented.
+* MBC1 mode-1 high-bit ROM banking and MBC5 9-bit banking are implemented;
+  non-power-of-two ROM bank counts are aliased with a bit mask rather than
+  reproducing every exotic PCB's wiring.
+* PPU access restrictions during modes 0–3 and OAM-bug corruption are not
+  emulated; the `oam_bug` failures above follow from that.
+* Rendering is per scanline at mode-3 entry; mid-scanline register changes and
+  the exact mode-3 fetch schedule are not modelled.
+* No CGB double-speed, CGB palettes, or stereo APU output. `STOP` is a short
+  pause. Serial transfers complete immediately.
+* No RTC persistence; only cartridge RAM is saved.
+* The terminal renderer is bandwidth-heavy on busy screens; prefer `--dump`.
