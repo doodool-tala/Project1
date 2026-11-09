@@ -4648,7 +4648,19 @@ apu_io_read:
     movzx eax,byte [apu_power]
     shl eax,7
     or eax,0x70
-    mov edx,[apu_active]
+    ; apu_active holds one byte per channel, so fold the four flags into
+    ; NR52 bits 0..3 individually (a dword load and low-nibble mask would
+    ; expose channel 1 only)
+    movzx edx,byte [apu_active+0]
+    movzx ecx,byte [apu_active+1]
+    shl ecx,1
+    or edx,ecx
+    movzx ecx,byte [apu_active+2]
+    shl ecx,2
+    or edx,ecx
+    movzx ecx,byte [apu_active+3]
+    shl ecx,3
+    or edx,ecx
     and edx,0x0F
     or eax,edx
     jmp .out
