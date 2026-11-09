@@ -1917,6 +1917,7 @@ prestep_done: resd 1   ; T-cycles already stepped before handler (intra-instruct
 apu_power:      resb 1
 apu_fs_step:    resb 1
 apu_fs_cyc:     resd 1
+apu_wave_flag:  resb 1
 apu_active:     resb 4
 apu_dac:        resb 4
 apu_len:        resw 4
@@ -4510,7 +4511,28 @@ apu_init:
     push rdi
     mov byte [apu_power],1
     mov byte [apu_fs_step],0
-    mov dword [apu_fs_cyc],0
+    mov byte [apu_wave_flag],0
+    ; frame sequencer phase: one step per 13-bit wrap of the DIV counter
+    mov eax,[div_counter]
+    and eax,0x1FFF
+    mov [apu_fs_cyc],eax
+    ; post-boot length-enable bits from NR14/NR24/NR34/NR44
+    mov al,[io+0x14]
+    shr al,6
+    and al,1
+    mov [apu_lenen+0],al
+    mov al,[io+0x19]
+    shr al,6
+    and al,1
+    mov [apu_lenen+1],al
+    mov al,[io+0x1E]
+    shr al,6
+    and al,1
+    mov [apu_lenen+2],al
+    mov al,[io+0x23]
+    shr al,6
+    and al,1
+    mov [apu_lenen+3],al
     ; length counters: NRx1 load values (max - value)
     movzx eax,byte [io+0x11]
     and eax,0x3F
@@ -4631,11 +4653,17 @@ apu_io_read:
     or eax,edx
     jmp .out
 .wave:
-    ; DMG: wave RAM is inaccessible while channel 3 plays; reads give $FF
+    ; DMG: while ch3 is active only the byte currently being fetched is
+    ; visible, and only on the cycle the fetch happens; else $FF.
     cmp byte [apu_active+2],0
     je .wave_plain
-    cmp byte [apu_dac+2],0
-    je .wave_plain
+    cmp byte [apu_wave_flag],0
+    je .wave_ff
+    movzx ecx,byte [apu_dutypos+2]
+    shr ecx,1
+    movzx eax,byte [rbx+rcx+0x30]
+    jmp .out
+.wave_ff:
     mov eax,0xFF
     jmp .out
 .wave_plain:
@@ -4666,9 +4694,37 @@ apu_io_write:
     je .nr52
     cmp byte [apu_power],0
     jne .powered
-    ; while off only NR41 (0x20) stays writable
+    ; DMG: while off, NRx1 still loads the length counter (the register
+    ; value itself is not stored). Every other register write is ignored.
+    cmp r13,0x11
+    je .off_len
+    cmp r13,0x16
+    je .off_len
+    cmp r13,0x1B
+    je .off_len
     cmp r13,0x20
     jne .done
+.off_len:
+    mov rax,r13
+    sub rax,0x10
+    xor edx,edx
+    mov ecx,5
+    div ecx
+    mov r12,rax
+    cmp r12d,2
+    je .off_len_wave
+    movzx eax,r14b
+    and eax,0x3F
+    mov ecx,64
+    sub ecx,eax
+    mov [apu_len+r12*2],cx
+    jmp .done
+.off_len_wave:
+    movzx eax,r14b
+    mov ecx,256
+    sub ecx,eax
+    mov [apu_len+r12*2],cx
+    jmp .done
 .powered:
     mov rax,r13
     sub rax,0x10
@@ -4769,7 +4825,7 @@ apu_io_write:
     jmp .done
 .reg4:
     cmp r12d,3
-    je .reg4_len
+    je .reg4_freq_done
     movzx eax,word [apu_freq+r12*2]
     and eax,0xFF
     movzx edx,r14b
@@ -4777,43 +4833,66 @@ apu_io_write:
     shl edx,8
     or eax,edx
     mov [apu_freq+r12*2],ax
-.reg4_len:
-    mov byte [apu_entrans],0
-    mov al,r14b
-    and al,0x40
-    mov dl,[apu_lenen+r12]
-    mov [apu_lenen+r12],al
-    test al,al
-    jz .reg4_trig
-    test dl,dl
-    jnz .reg4_trig
-    mov byte [apu_entrans],1
-    ; enable 0->1: extra length clock if next fs step does not clock length
-    test byte [apu_fs_step],1
-    jz .reg4_trig
+.reg4_freq_done:
+    ; trigger first (may reload a zero length), then handle the 0->1
+    ; length-enable transition and its extra length clock.
+    test r14b,0x80
+    jz .reg4_no_trig
     movzx eax,word [apu_len+r12*2]
     test eax,eax
-    jz .reg4_trig
+    setz r15b
+    movzx r15d,r15b
+    push r15
+    mov rdi,r12
+    call apu_trigger
+    pop r15
+    test r15d,r15d
+    jz .reg4_no_trig
+    mov byte [apu_lenen+r12],0
+.reg4_no_trig:
+    test r14b,0x40
+    jz .reg4_dis_len
+    cmp byte [apu_lenen+r12],0
+    jne .reg4_set_len
+    ; 0->1: extra clock iff the upcoming fs step doesn't clock length
+    test byte [apu_fs_step],1
+    jnz .reg4_set_len
+    movzx eax,word [apu_len+r12*2]
+    test eax,eax
+    jz .reg4_set_len
     dec eax
     mov [apu_len+r12*2],ax
     test eax,eax
-    jnz .reg4_trig
+    jnz .reg4_set_len
     test r14b,0x80
-    jnz .reg4_trig
+    jz .reg4_zero_off
+    mov ecx,64
+    cmp r12d,2
+    jne .reg4_zero_max
+    mov ecx,256
+.reg4_zero_max:
+    mov [apu_len+r12*2],cx
+    jmp .reg4_set_len
+.reg4_zero_off:
     mov byte [apu_active+r12],0
     mov byte [apu_frozen+r12],1
-.reg4_trig:
-    test r14b,0x80
-    jz .done
-    mov rdi,r12
-    call apu_trigger
+.reg4_set_len:
+    mov byte [apu_lenen+r12],1
+    jmp .done
+.reg4_dis_len:
+    mov byte [apu_lenen+r12],0
     jmp .done
 .wave:
-    ; wave RAM: always writable when ch3 is off; ignored while it plays
+    ; DMG: while ch3 is active only the byte being fetched is visible, and
+    ; only on a fetch cycle; other CPU accesses are ignored.
     cmp byte [apu_active+2],0
     je .wave_store
-    cmp byte [apu_dac+2],0
-    je .wave_store
+    cmp byte [apu_wave_flag],0
+    je .done
+    lea rbx,[io]
+    movzx eax,byte [apu_dutypos+2]
+    shr eax,1
+    mov [rbx+rax+0x30],r14b
     jmp .done
 .wave_store:
     lea rbx,[io]
@@ -4825,11 +4904,14 @@ apu_io_write:
     cmp byte [apu_power],0
     jne .done
     mov byte [apu_power],1
+    mov byte [apu_fs_step],0
     jmp .done
 .nr52_off:
     cmp byte [apu_power],0
     je .done
     mov byte [apu_power],0
+    mov byte [apu_fs_step],0
+    mov byte [apu_wave_flag],0
     ; zero NR10..NR51 and all channel state
     lea rbx,[io]
     xor ecx,ecx
@@ -4883,8 +4965,9 @@ apu_trigger:
     push r12
     push r13
     mov r12,rdi
-    ; length: 0 becomes maximum; if enabled and next fs step doesn't clock
-    ; length, the reload is decremented (hardware quirk)
+    mov r13b,[apu_active+r12]
+    ; length: 0 becomes maximum (any extra clock is applied by the
+    ; caller's 0->1 enable path, as on hardware)
     movzx eax,word [apu_len+r12*2]
     test eax,eax
     jnz .trig_len_done
@@ -4893,16 +4976,21 @@ apu_trigger:
     jne .trig_max
     mov ecx,256
 .trig_max:
-    mov eax,ecx
-    cmp byte [apu_entrans],0
-    je .trig_len_set
-    test byte [apu_fs_step],1
-    jz .trig_len_set
-    dec eax
-.trig_len_set:
-    mov [apu_len+r12*2],ax
+    mov [apu_len+r12*2],cx
 .trig_len_done:
     mov byte [apu_frozen+r12],0
+    ; wave: DMG corrupts wave RAM when retriggered while the fetch timer
+    ; is 2 cycles from expiring
+    cmp r12d,2
+    jne .trig_dac
+    test r13b,r13b
+    jz .trig_dac
+    cmp byte [apu_dac+2],0
+    je .trig_dac
+    cmp dword [apu_timer+8],2
+    jne .trig_dac
+    call apu_wave_corrupt
+.trig_dac:
     ; channel becomes active if its DAC is on
     cmp byte [apu_dac+r12],0
     je .trig_dac_done
@@ -4932,6 +5020,11 @@ apu_trigger:
     mov [apu_envtimer+r12],al
 .trig_ch3:
     call apu_reload_timer
+    cmp r12d,2
+    jne .trig_sweep
+    mov byte [apu_dutypos+2],0
+    add dword [apu_timer+8],6
+.trig_sweep:
     test r12d,r12d
     jnz .trig_done
     call apu_sweep_trigger
@@ -4940,6 +5033,33 @@ apu_trigger:
     pop r12
     pop rdi
     pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; apu_wave_corrupt: DMG wave-RAM corruption on a retrigger while the
+; fetch timer is 2 cycles from expiring: the current 4-byte block is
+; copied to the start of wave RAM.
+apu_wave_corrupt:
+    push rbx
+    push rcx
+    push rdx
+    lea rbx,[io+0x30]
+    movzx eax,byte [apu_dutypos+2]
+    inc eax
+    shr eax,1
+    and eax,0x0F
+    cmp eax,4
+    jae .block
+    mov dl,[rbx+rax]
+    mov [rbx],dl
+    jmp .done
+.block:
+    and eax,0x0C
+    mov ecx,[rbx+rax]
+    mov [rbx],ecx
+.done:
     pop rdx
     pop rcx
     pop rbx
@@ -5176,6 +5296,9 @@ apu_step:
     push r14
     push r15
     mov r14,rdi
+    mov byte [apu_wave_flag],0
+    cmp byte [apu_power],0
+    je .fs_start
     ; channel sample timers
     xor r12d,r12d
 .tim_loop:
@@ -5194,9 +5317,35 @@ apu_step:
     and byte [apu_dutypos+r12],7
     jmp .tim_reload
 .tim_wave:
-    inc byte [apu_dutypos+r12]
-    and byte [apu_dutypos+r12],31
-    jmp .tim_reload
+    ; one nibble per (2048-freq)*2 cycles; loop over every expiry in the
+    ; chunk and flag a fetch only when the chunk ends exactly on one
+    cmp byte [apu_active+2],0
+    je .tim_wave_off
+    cmp byte [apu_dac+2],0
+    je .tim_wave_off
+    movzx ecx,word [apu_freq+4]
+    mov edi,2048
+    sub edi,ecx
+    shl edi,1
+    test edi,edi
+    jnz .tim_wave_period
+    mov edi,1
+.tim_wave_period:
+.tim_wave_loop:
+    add eax,edi
+    inc byte [apu_dutypos+2]
+    and byte [apu_dutypos+2],31
+    cmp eax,0
+    jle .tim_wave_loop
+    cmp eax,edi
+    jne .tim_wave_store
+    mov byte [apu_wave_flag],1
+.tim_wave_store:
+    mov [apu_timer+r12*4],eax
+    jmp .tim_next
+.tim_wave_off:
+    mov dword [apu_timer+r12*4],0
+    jmp .tim_next
 .tim_noise:
     movzx eax,word [apu_lfsr]
     mov edx,eax
@@ -5219,32 +5368,35 @@ apu_step:
     inc r12d
     cmp r12d,4
     jb .tim_loop
-    ; frame sequencer
+.fs_start:
+    ; frame sequencer: one step per 13-bit wrap of the DIV counter
     add [apu_fs_cyc],r14d
 .fs_loop:
     cmp dword [apu_fs_cyc],8192
     jb .done
     sub dword [apu_fs_cyc],8192
     mov al,[apu_fs_step]
+    cmp al,7
+    je .fs_env
+    test al,1
+    jnz .fs_advance
+    call apu_clock_length
+    mov al,[apu_fs_step]
+    cmp al,2
+    je .fs_sweep
+    cmp al,6
+    je .fs_sweep
+    jmp .fs_advance
+.fs_sweep:
+    call apu_clock_sweep
+    jmp .fs_advance
+.fs_env:
+    call apu_clock_env
+.fs_advance:
+    mov al,[apu_fs_step]
     inc al
     and al,7
     mov [apu_fs_step],al
-    test al,1
-    jz .fs_even
-    call apu_clock_length
-    mov al,[apu_fs_step]
-    cmp al,3
-    je .fs_sweep
-    cmp al,7
-    je .fs_sweep
-    jmp .fs_loop
-.fs_even:
-    test al,al
-    jnz .fs_loop
-    call apu_clock_env
-    jmp .fs_loop
-.fs_sweep:
-    call apu_clock_sweep
     jmp .fs_loop
 .done:
     pop r15

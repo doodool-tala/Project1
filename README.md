@@ -141,35 +141,61 @@ re-loaded on the next run.
 
 ## dmg_sound (APU) results
 
-Each single ROM was run headless (4000 frames) and its own `$A000`
-verdict byte, `DE B0 61` signature and text were read back. 2 of 12 pass:
+Each single ROM was run headless (2200 frames, well past every subtest)
+and its own `$A000` verdict byte, `DE B0 61` signature and text were read
+back. **5 of 12 pass:**
 
 | ROM | status | result |
 | --- | --- | --- |
 | 01-registers | 0 | `Passed` |
 | 06-overflow on trigger | 0 | `Passed` (`0556 0667 071D 0788 07C2 07E1 07F1`) |
-| 02-len ctr | 2 | Failed #2 "Length becoming 0 should clear status" |
-| 03-trigger | 4 | Failed #4 "Anything besides enabling shouldnt't clock" |
+| 09-wave read while on | 0 | `Passed` (wave-RAM read gating + fetch phase) |
+| 10-wave trigger while on | 0 | `Passed` (DMG trigger corruption offsets) |
+| 12-wave write while on | 0 | `Passed` (write/fetch coupling) |
+| 02-len ctr | 7 | Failed #7 "Trigger with disabled length should convert 0 length to maximum" |
+| 03-trigger | 5 | Failed #5 "If clock makes length zero, should disable chan" |
 | 04-sweep | 8 | Failed #8 "If shift=0 and period>0, trigger enables" |
-| 05-sweep details | 8 | Failed #8 "Subtract mode uses two's complement (upper bound)" |
+| 05-sweep details | 7 | Failed #7 "Subtract mode uses two's complement" |
 | 07-len sweep period sync | 2 | Failed #2 "Length period is wrong" |
-| 08-len ctr during power | 1 | Failed; lengths read back `00 00 40 00` (DMG expects `11 22 44 33`) |
-| 09-wave read while on | 1 | Failed; every read returns `FF` |
-| 10-wave trigger while on | 1 | Failed; post-trigger wave-RAM rows differ |
+| 08-len ctr during power | 1 | Failed; lengths read back `00 00 11 00`, CRC `729DFC0C` (DMG expects `11 22 44 33`) |
 | 11-regs after power | 4 | Failed #4 "Powering off shouldn't affect NR41" |
-| 12-wave write while on | 1 | Failed; playback-time writes not coupled to the fetch cycle |
 
-The multicart `dmg_sound.gb` runs the same tests and halts on the first
-failing subtest, so it produces no final verdict.
+The wave family (09/10/12) and the register/trigger-overflow tests
+(01/06) now pass. The remaining seven failures share one root cause:
+the DMG **extra length clock** when length enable is written 0 -> 1.
+The sequencer model here fires it from the coarse step-window parity
+(`apu_fs_step`), while hardware decides from the sub-step phase of the
+length signal at the moment of the write, so the result depends on where
+in the 8192-cycle step the write lands.
+
+The multicart `dmg_sound.gb` demonstrates that phase dependence directly.
+After 9000 headless frames its `$A000` status is still `80` (running) and
+the text contains one result per run, with the same test passing at one
+alignment and failing at the next three:
+
+```
+01:ok 02:07 03:05 04:08 05:ok 06:06 07:05 08:08 09:ok 10:07 11:05 12:08
+13:ok 14:07 15:05 16:08 17:ok 18:02 19:05 20:08 21:ok 22:07 23:05 24:08
+25:ok 26:07 27:05 28:08 29:ok 30:06 31:05 32:08 ...
+```
+
+Every fourth group is `ok`; the others fail at the length/sweep subtests
+whose expected value changes with the sub-step phase. That is consistent
+with the singles' results above (a register/plumbing model that is right
+for one phase and off by one clock for the others), and it is why the
+multicart does not reach a final `Passed` verdict in this build.
 
 ## Known limitations
 
-* APU: frame sequencer, length/envelope/sweep clocks, DAC gating and NR52
-  power semantics are implemented, but the exact phase of the DMG
-  extra-length clock at step boundaries, the wave-RAM fetch-cycle
-  coupling while channel 3 plays, and a few sweep negate/period-0 edge
-  cases still differ from hardware, which is what the table above
-  measures. No stereo panning in the WAV output.
+* APU: frame sequencer, length/envelope/sweep clocks, DAC gating, NR52
+  power semantics, wave-RAM read/write gating and the DMG trigger
+  corruption are implemented and measured (5/12 `dmg_sound` singles
+  pass, including the whole wave family). Still wrong: the sub-step
+  phase of the DMG **extra length clock** on a length-enable 0 -> 1
+  write (the singles' length/sweep sync tests and the multicart all
+  depend on it), two sweep upper-bound/period-0 edge cases, and the
+  length-counter readback during power transitions. No stereo panning
+  in the WAV output.
 * MBC1 in mode-1 high-bit ROM banking, and MBC3 RTC, are stubs.
 * A cartridge with CGB double-speed mode, or the `STOP` instruction, will
   run at DMG speed only (STOP is treated as a short pause).
