@@ -199,10 +199,9 @@ DIV-aligned: ticks at frame-sequencer steps 2 and 6, four steps = 32768
 cycles = 128 Hz apart. All twelve singles now print `Passed` with status
 0 and signature `DE B0 61`.
 
-The multicart `dmg_sound.gb` runs each test at four alignments. Every
-entry printed during a 45000-frame headless run was `ok`; the run needs
-more frames than fit in one command window to reach its own final
-verdict, since each entry costs about 800 frames.
+The multicart `dmg_sound.gb` runs every test at four alignments. At 80000
+headless frames it has printed 190 `ok` entries and its `$A000` status is
+`80` (`ÿØ%C¥           1C  ko:0C*¤Yã¾ØP(ÿÿ`1ÿ`1%ÿ`¬(å#`>#`).
 
 ## Known limitations
 
