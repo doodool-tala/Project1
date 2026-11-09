@@ -920,6 +920,12 @@ read_mem:
     mov ecx,[mbc_rom_bank]
     cmp byte [mbc_type],0x13
     je .mbc3bank
+    cmp byte [mbc_type],0x01
+    je .mbc1bank
+    cmp byte [mbc_type],0x02
+    je .mbc1bank
+    cmp byte [mbc_type],0x03
+    je .mbc1bank
     cmp byte [mbc_type],0x11
     je .mbc1bank
     cmp byte [mbc_type],0x12
@@ -1136,6 +1142,12 @@ write_mem:
 .mbc_rombank_w:
     cmp byte [mbc_type],0x13
     je .mbc3_rom
+    cmp byte [mbc_type],0x01
+    je .mbc1_rom
+    cmp byte [mbc_type],0x02
+    je .mbc1_rom
+    cmp byte [mbc_type],0x03
+    je .mbc1_rom
     cmp byte [mbc_type],0x11
     je .mbc1_rom
     cmp byte [mbc_type],0x12
@@ -1168,6 +1180,12 @@ write_mem:
     mov [mbc_rom_bank],eax
     jmp .out
 .mbc_mode_w:
+    cmp byte [mbc_type],0x01
+    je .setmode
+    cmp byte [mbc_type],0x02
+    je .setmode
+    cmp byte [mbc_type],0x03
+    je .setmode
     cmp byte [mbc_type],0x11
     je .setmode
     cmp byte [mbc_type],0x12
@@ -1179,6 +1197,12 @@ write_mem:
 .mbc_rambank_w:
     cmp byte [mbc_type],0x13
     je .mbc3_ram
+    cmp byte [mbc_type],0x01
+    je .mbc1_ram
+    cmp byte [mbc_type],0x02
+    je .mbc1_ram
+    cmp byte [mbc_type],0x03
+    je .mbc1_ram
     cmp byte [mbc_type],0x11
     je .mbc1_ram
     cmp byte [mbc_type],0x12
