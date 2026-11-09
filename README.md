@@ -143,76 +143,68 @@ re-loaded on the next run.
 
 Each single ROM was run headless (2200 frames, well past every subtest)
 and its own `$A000` verdict byte, `DE B0 61` signature and text were read
-back. **5 of 12 pass:**
+back. **10 of 12 pass:**
 
 | ROM | status | result |
 | --- | --- | --- |
 | 01-registers | 0 | `Passed` |
-| 06-overflow on trigger | 0 | `Passed` (`0556 0667 071D 0788 07C2 07E1 07F1`) |
-| 09-wave read while on | 0 | `Passed` (wave-RAM read gating + fetch phase) |
-| 10-wave trigger while on | 0 | `Passed` (DMG trigger corruption offsets) |
-| 12-wave write while on | 0 | `Passed` (write/fetch coupling) |
-| 02-len ctr | 6 | Failed #6 "Trigger should treat 0 length as maximum" |
-| 03-trigger | 2 | Failed #2 "Enabling in second half of length period shouldn't clock length" |
+| 02-len ctr | 0 | `Passed` |
+| 03-trigger | 0 | `Passed` |
 | 04-sweep | 8 | Failed #8 "If shift=0 and period>0, trigger enables" |
 | 05-sweep details | 8 | Failed #8 "Subtract mode uses two's complement (upper bound)" |
-| 07-len sweep period sync | 2 | Failed #2 "Length period is wrong" |
-| 08-len ctr during power | 1 | Failed; lengths read back `00 00 11 00`, CRC `729DFC0C` (DMG expects `11 22 44 33`) |
-| 11-regs after power | 4 | Failed #4 "Powering off shouldn't affect NR41" |
+| 06-overflow on trigger | 0 | `Passed` (`0555 0666 071C 0787 07C1 07E0 07F0 0556 0667 071D 0788 07C2 07E1 07F1`) |
+| 07-len sweep period sync | 0 | `Passed` |
+| 08-len ctr during power | 0 | `Passed`; counter dump `33 44 11 22` (the ROM's own print order) |
+| 09-wave read while on | 0 | `Passed` |
+| 10-wave trigger while on | 0 | `Passed` |
+| 11-regs after power | 0 | `Passed`, including #4 |
+| 12-wave write while on | 0 | `Passed` |
 
-The wave family (09/10/12) and the register/trigger-overflow tests
-(01/06) now pass. The NRx4 length block was rewritten this pass to
-follow Pan Docs in hardware order: a 0 -> 1 length-enable edge clocks
-the length once when the next DIV-APU step does not clock length (the
-write lands in the first half of the length period) and the counter is
-non-zero, disabling the channel if that reaches zero without a trigger;
-a trigger then unfreezes a zero counter and reloads it to maximum,
-landing on max-1 when the length is enabled by the same write and the
-next step does not clock length. That moved 02 from #7 to #6 and 03
-from #5 to #2.
 
-The remaining failures are a **phase anchor** problem, measured rather
-than assumed. At test 03 #2 the write happens 8256 T-cycles after
-`sync_apu`, which blargg calibrates to be the *second* half of the
-length period (the first half ends at 8192), so no extra clock must
-occur. The frame-sequencer trace logs
-`W4 s=05 c=0405 ch=00 v=40 e=00 l=0002`, i.e. the write is only ~65
-cycles after a length clock was processed, so the model classifies it
-as the first half and clocks it. In other words `sync_apu` unblocks one
-length period later here than on hardware, and every derived phase
-(03 #2/#3, 02 #6/#7, 07 #2, 11 #4) inherits that offset. The trace also
-shows two length decrements between consecutive NR24 writes at the same
-sequencer step with no length clock logged between them, so the trigger
-path needs the same audit before the anchor can be trusted.
+The five length/trigger/power ROMs (02, 03, 07, 08, 11) were failing on
+one bus bug rather than on five separate behaviours. `apu_active` stores
+one byte per channel, but the NR52 read loaded it as a dword and masked
+the low nibble, so only channel 1's active flag could ever reach the CPU:
+every `lda NR52 / and mask` poll for channels 2-4 read zero. Folding each
+byte into its own bit fixed all five at once, and 08's own dump
+`33 44 11 22` now matches its DMG reference CRC, so the ROM prints
+`Passed` with status 0.
 
-The multicart `dmg_sound.gb` demonstrates that phase dependence directly.
-After 9000 headless frames its `$A000` status is still `80` (running) and
-the text contains one result per run, with the same test passing at one
-alignment and failing at the next three:
+The power-off/on semantics are implemented and measured separately: while
+NR52 bit 7 is clear the frame sequencer neither steps nor clocks anything,
+and the power-on write restarts step and phase together so no backlog is
+replayed. A register-preserving trace shows the four counters holding
+`11 22 44 33` (with all enable bits clear, power 0, step 0) across the
+power-down and zero length clocks while off, and 11 #4 passes because the
+off-state NR41 load survives the power cycle.
+
+What remains is two sweep-calculation subtests (04 #8 and 05 #8): the
+immediate recalculation when NR10 is written with period>0 and shift>0,
+and the negate-mode upper bound.
+
+The multicart `dmg_sound.gb` runs each test at four alignments. After
+12000 headless frames its `$A000` status is still `80` (running), and
+every fourth run is `ok` while the others fail at subtest 8:
 
 ```
-01:ok 02:07 03:05 04:08 05:ok 06:06 07:05 08:08 09:ok 10:07 11:05 12:08
-13:ok 14:07 15:05 16:08 17:ok 18:02 19:05 20:08 21:ok 22:07 23:05 24:08
-25:ok 26:07 27:05 28:08 29:ok 30:06 31:05 32:08 ...
+01:ok 02:ok 03:ok 04:08 05:ok 06:ok 07:ok 08:08 09:ok 10:ok 11:ok 12:08
+13:ok 14:ok 15:ok 16:08 17:ok 18:ok 19:ok 20:08 21:ok 22:ok 23:ok 24:08
 ```
 
-Every fourth group is `ok`; the others fail at the length/sweep subtests
-whose expected value changes with the sub-step phase. That is the same
-signature as the singles above and is why the multicart does not reach a
-final `Passed` verdict in this build.
+That is the same sweep edge case as 04 #8 / 05 #8, so the multicart has no
+final verdict yet.
 
 ## Known limitations
 
 * APU: frame sequencer, length/envelope/sweep clocks, DAC gating, NR52
   power semantics, wave-RAM read/write gating and the DMG trigger
-  corruption are implemented and measured (5/12 `dmg_sound` singles
-  pass, including the whole wave family). Still wrong: `sync_apu`'s
-  exit sits one length period later than hardware, which shifts every
-  length-period phase the remaining tests measure; a duplicate length
-  decrement between two NR24 writes in the same sequencer step; two
-  sweep upper-bound/period-0 edge cases; and the length-counter readback
-  during power transitions (`00 00 10 00` instead of `11 22 44 33`).
-  No stereo panning in the WAV output.
+  corruption are implemented and measured (10/12 `dmg_sound` singles
+  pass, including all four wave ROMs, both length-counter/power ROMs and
+  the trigger ROM). Still wrong: two sweep-calculation subtests
+  (04 #8 "If shift=0 and period>0, trigger enables" and 05 #8 "Subtract
+  mode uses two's complement (upper bound)") - the immediate NR10
+  recalculation and the negate-mode upper bound - which is also why the
+  multicart has no final verdict. No stereo panning in the WAV output.
 * MBC1 in mode-1 high-bit ROM banking, and MBC3 RTC, are stubs.
 * A cartridge with CGB double-speed mode, or the `STOP` instruction, will
   run at DMG speed only (STOP is treated as a short pause).
