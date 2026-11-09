@@ -4780,13 +4780,20 @@ apu_io_write:
     mov al,r14b
     and al,7
     mov [apu_sweepshift],al
-    mov al,[apu_sweepper]
-    or al,[apu_sweepshift]
-    jz .nr10_off
-    mov byte [apu_sweepenable],1
-    jmp .done
-.nr10_off:
-    mov byte [apu_sweepenable],0
+    ; the sweep enable is latched at trigger (period!=0 or shift!=0); an
+    ; NR10 write does not change it, so a trigger with period=0 and
+    ; shift=0 leaves the unit disabled until the next trigger.
+    ; While enabled, a write with shift!=0 recalculates immediately from
+    ; the frequency registers, not from the already-swept shadow.
+    cmp byte [apu_sweepenable],0
+    je .done
+    cmp byte [apu_sweepper],0
+    je .done
+    cmp byte [apu_sweepshift],0
+    je .done
+    mov ax,[apu_freq]
+    mov [apu_shadow],ax
+    call apu_sweep_calc
     jmp .done
 .reg0_ch3:
     ; NR30: wave DAC
